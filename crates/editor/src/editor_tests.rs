@@ -14032,9 +14032,9 @@ async fn test_add_selection_unwrapped_mode_switch_resets_groups(cx: &mut TestApp
             let width = editor
                 .display_snapshot(cx)
                 .layout_row(DisplayRow(0), &details)
-                .width
+                .width()
                 / 2.0;
-            editor.set_wrap_width(Some(width), cx);
+            editor.set_wrap_width(Some(Pixels::from(width)), cx);
             assert_eq!(
                 editor.display_text(cx),
                 "abcdefgh\nijklmnop\nqrstuvwx\nyzABCDEF\n01234567\n89abcdef",
@@ -14067,9 +14067,9 @@ async fn test_add_selection_unwrapped_eof_and_skipped_range_terminate(cx: &mut T
             let width = editor
                 .display_snapshot(cx)
                 .layout_row(DisplayRow(0), &details)
-                .width
+                .width()
                 / 4.0;
-            editor.set_wrap_width(Some(width), cx);
+            editor.set_wrap_width(Some(Pixels::from(width)), cx);
             assert!(editor.display_snapshot(cx).max_point().row().0 >= 3);
             for _ in 0..2 {
                 add_selection_in_direction(editor, false, true, window, cx);
