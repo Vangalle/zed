@@ -481,6 +481,7 @@ fn editor_render_unwrapped_long_lines(script: &&str, cx: &mut BenchAppContext) {
         "newline_undo",
         "select_to_line_start",
         "scroll_with_search_highlights",
+        "scroll_far_right",
         "type_cjk",
         "up_down_cjk",
         "scroll_cjk",
@@ -507,6 +508,7 @@ fn editor_edit_huge_unwrapped_line(operation: &&str, cx: &mut BenchAppContext) {
             let mut editor = Editor::new(EditorMode::full(), buffer, None, window, cx);
             editor.set_style(editor::EditorStyle::default(), window, cx);
             editor.set_soft_wrap_mode(language::language_settings::SoftWrap::None, cx);
+            editor.set_use_selection_highlight(false);
             editor.move_to_end_of_line(&Default::default(), window, cx);
             editor
         });
@@ -539,16 +541,37 @@ fn editor_edit_huge_unwrapped_line(operation: &&str, cx: &mut BenchAppContext) {
     }
     let mut toggle = false;
     let mut scroll_columns = 0.;
+    let scroll_start = if operation == "scroll_far_right" {
+        (long_line.len() - 6_000) as f64
+    } else {
+        0.
+    };
     cx.bench_renderer(editor, move |editor, window, cx| {
         toggle = !toggle;
         match operation {
-            "scroll_with_search_highlights" | "scroll_cjk" => {
+            "scroll_with_search_highlights" | "scroll_far_right" | "scroll_cjk" => {
                 scroll_columns = (scroll_columns + 3.) % 3_000.;
-                editor.set_scroll_position(gpui::point(scroll_columns, 0.), window, cx);
+                editor.set_scroll_position(
+                    gpui::point(scroll_start + scroll_columns, 0.),
+                    window,
+                    cx,
+                );
             }
-            "type" => editor.handle_input("x", window, cx),
-            "type_cjk" => editor.handle_input("漢", window, cx),
-            "backspace" => editor.backspace(&Default::default(), window, cx),
+            "type" | "type_cjk" => {
+                if toggle {
+                    let inserted = if operation == "type" { "x" } else { "漢" };
+                    editor.handle_input(inserted, window, cx);
+                } else {
+                    editor.backspace(&Default::default(), window, cx);
+                }
+            }
+            "backspace" => {
+                if toggle {
+                    editor.backspace(&Default::default(), window, cx);
+                } else {
+                    editor.handle_input(" ", window, cx);
+                }
+            }
             "left_right" => {
                 if toggle {
                     editor.move_left(&Default::default(), window, cx);

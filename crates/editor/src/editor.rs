@@ -1314,7 +1314,6 @@ impl GutterDimensions {
 
 struct CharacterDimensions {
     em_width: Pixels,
-    em_advance: Pixels,
     line_height: Pixels,
 }
 
@@ -3882,7 +3881,6 @@ impl Editor {
         // If the selection spans multiple rows OR it is empty
         if selection.start.row != selection.end.row
             || selection.start.column == selection.end.column
-            || (selection.end.column - selection.start.column) as usize > MAX_LINE_LEN
         {
             return None;
         }
@@ -11202,11 +11200,9 @@ impl Editor {
         let font_size = style.text.font_size.to_pixels(window.rem_size());
         let line_height = style.text.line_height_in_pixels(window.rem_size());
         let em_width = window.text_system().em_width(font_id, font_size).unwrap();
-        let em_advance = window.text_system().em_advance(font_id, font_size).unwrap();
 
         CharacterDimensions {
             em_width,
-            em_advance,
             line_height,
         }
     }

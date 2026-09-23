@@ -1051,12 +1051,12 @@ impl<'a> TabStopCursor<'a> {
     }
 }
 
-#[inline(always)]
 fn tab_expanded_chars(input_chars: u32, output_bytes: u32, input_bytes: u32) -> u32 {
     let tab_expansion = i64::from(output_bytes) - i64::from(input_bytes);
     u32::try_from(i64::from(input_chars) + tab_expansion).unwrap_or(0)
 }
 
+#[inline(always)]
 fn count_chars_in_byte_range(range: Range<u32>, bitmap: u128) -> u32 {
     let low_mask = u128::MAX << range.start;
     let high_mask = u128::MAX >> (127 - range.end);

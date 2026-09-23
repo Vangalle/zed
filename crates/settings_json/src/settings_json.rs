@@ -158,9 +158,9 @@ pub fn replace_value_in_json_text<T: AsRef<str>>(
             .get(key_range.clone())
             .zip(key_path.get(depth))
             .and_then(|(key_text, key_path_value)| {
-                serde_json::from_str::<String>(key_text)
+                serde_json::to_string(key_path_value.as_ref())
                     .ok()
-                    .map(|decoded_key| decoded_key == key_path_value.as_ref())
+                    .map(|key_path| depth < key_path.len() && key_text == key_path)
             })
             .unwrap_or(false);
 

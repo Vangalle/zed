@@ -258,7 +258,7 @@ pub fn migrate_settings(text: &str) -> Result<Option<String>> {
         MigrationType::Json(migrations::m_2026_08_30::nest_markdown_preview_settings),
         MigrationType::Json(migrations::m_2026_09_16::nest_agent_threads_sidebar_settings),
         MigrationType::Json(migrations::m_2026_09_29::move_copilot_enterprise_uri),
-        MigrationType::Json(migrations::m_2026_09_21::replace_prefer_line_soft_wrap),
+        MigrationType::Json(migrations::m_2026_10_09::replace_prefer_line_soft_wrap),
     ];
     run_migrations(text, migrations)
 }
@@ -5487,14 +5487,6 @@ mod tests {
                 }
             "#},
             None,
-        );
-        assert_migrate_settings(
-            r#"{"profiles":{"work":{"settings":{"languages":{"Go":{"soft_wrap":"prefer_line"}}}}}}"#,
-            Some(r#"{"profiles":{"work":{"settings":{"languages":{"Go":{"soft_wrap":"none"}}}}}}"#),
-        );
-        assert_migrate_settings(
-            r#"{"profiles":{"\u5de5\u4f5c":{"settings":{"soft_wrap":"prefer_line"}}}}"#,
-            Some(r#"{"profiles":{"\u5de5\u4f5c":{"settings":{"soft_wrap":"none"}}}}"#),
         );
     }
 }

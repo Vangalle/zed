@@ -119,7 +119,8 @@ use sum_tree::{Bias, TreeMap};
 use text::{BufferId, LineIndent, Patch};
 use theme::StatusColors;
 use ui::{SharedString, px};
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
+use util::debug_panic;
 use ztracing::instrument;
 
 use std::cell::RefCell;
@@ -131,7 +132,7 @@ use std::{
     num::NonZeroU32,
     ops::{self, Add, Range, RangeInclusive, Sub},
     slice,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use crate::{
@@ -143,13 +144,237 @@ use crate::{
 };
 use block_map::{BlockPointCursor, BlockRow, BlockSnapshot};
 use fold_map::{Chunk, FoldPointCursor, FoldSnapshot};
-use inlay_map::{BufferOffsetToInlayPointCursor, InlaySnapshot};
+use inlay_map::{BufferOffsetToInlayPointCursor, InlaySnapshot, has_chunk_renderer};
 use itertools::Either;
-use row_ruler::RowRulerCache;
-pub use row_ruler::{RowRuler, RulerShaper};
+use parking_lot::Mutex;
+pub use row_ruler::{RenderPiece, RowRuler, RulerShaper, renderer_metrics_key};
+use row_ruler::{RowRulerCache, RulerCacheVersion};
 pub(crate) use tab_map::TabPoint;
 use tab_map::{TabPointCursor, TabSnapshot};
 use wrap_map::{WrapMap, WrapPatch, WrapPointCursor};
+
+fn is_grid_byte(byte: u8) -> bool {
+    (byte >= 0x20 && byte != 0x7f) || byte == b'\t' || byte == b'\n'
+}
+
+fn all_grid_bytes(bytes: &[u8]) -> bool {
+    let found_control = bytes.iter().fold(false, |found_control, byte| {
+        found_control | !is_grid_byte(*byte)
+    });
+    !found_control
+}
+
+const MAX_TRACKED_RULER_DIRT: usize = 64;
+
+#[derive(Default)]
+struct RulerDirt {
+    all: bool,
+    ranges: Vec<Range<Anchor>>,
+}
+
+fn same_diagnostics(
+    old_buffer: &MultiBufferSnapshot,
+    old_range: Range<MultiBufferOffset>,
+    buffer: &MultiBufferSnapshot,
+    range: Range<MultiBufferOffset>,
+) -> bool {
+    let key = |base: MultiBufferOffset| {
+        move |entry: language::DiagnosticEntryRef<'_, MultiBufferOffset>| {
+            (
+                entry.range.start.0.wrapping_sub(base.0),
+                entry.range.end.0.wrapping_sub(base.0),
+                entry.diagnostic.severity,
+                entry.diagnostic.underline,
+                entry.diagnostic.is_unnecessary,
+            )
+        }
+    };
+    old_buffer
+        .diagnostics_in_range(old_range.clone())
+        .map(key(old_range.start))
+        .eq(buffer
+            .diagnostics_in_range(range.clone())
+            .map(key(range.start)))
+}
+
+fn same_syntax(
+    old_buffer: &MultiBufferSnapshot,
+    old_range: Range<MultiBufferOffset>,
+    buffer: &MultiBufferSnapshot,
+    range: Range<MultiBufferOffset>,
+) -> bool {
+    let old_ranges = old_buffer.range_to_buffer_ranges(old_range);
+    let new_ranges = buffer.range_to_buffer_ranges(range);
+    let unstyled = |buffer: &language::BufferSnapshot,
+                    range: &Range<multi_buffer::BufferOffset>| {
+        buffer
+            .syntax_layers_for_range(range.start.0..range.end.0, true)
+            .next()
+            .is_none()
+    };
+    old_ranges.len() == new_ranges.len()
+        && old_ranges.iter().zip(&new_ranges).all(
+            |((old_buffer, old_range, _), (new_buffer, new_range, _))| {
+                old_buffer.remote_id() == new_buffer.remote_id()
+                    && (old_buffer.syntax_update_count() == new_buffer.syntax_update_count()
+                        || unstyled(old_buffer, old_range) && unstyled(new_buffer, new_range))
+            },
+        )
+}
+
+fn affects_shaping(style: &HighlightStyle) -> bool {
+    style.color.is_some()
+        || style.font_weight.is_some()
+        || style.font_style.is_some()
+        || style.underline.is_some()
+        || style.strikethrough.is_some()
+        || style.fade_out.is_some()
+}
+
+fn anchor_hull(ranges: &[Range<Anchor>], buffer: &MultiBufferSnapshot) -> Option<Range<Anchor>> {
+    let start = ranges
+        .iter()
+        .map(|range| range.start)
+        .min_by(|a, b| a.cmp(b, buffer))?;
+    let end = ranges
+        .iter()
+        .map(|range| range.end)
+        .max_by(|a, b| a.cmp(b, buffer))?;
+    Some(start..end)
+}
+
+fn wrap_row_for_offset(block_snapshot: &BlockSnapshot, offset: MultiBufferOffset) -> u32 {
+    let wrap_snapshot = &block_snapshot.wrap_snapshot;
+    let tab_snapshot = &wrap_snapshot.tab_snapshot;
+    let fold_snapshot = &tab_snapshot.fold_snapshot;
+    let inlay_snapshot = &fold_snapshot.inlay_snapshot;
+    let inlay_point = inlay_snapshot.to_point(inlay_snapshot.to_inlay_offset(offset));
+    let fold_point = fold_snapshot.to_fold_point(inlay_point, Bias::Left);
+    let tab_point = tab_snapshot.fold_point_to_tab_point(fold_point);
+    wrap_snapshot.tab_point_to_wrap_point(tab_point).row().0
+}
+
+fn row_buffer_range(block_snapshot: &BlockSnapshot, wrap_row: u32) -> Range<MultiBufferOffset> {
+    let wrap_snapshot = &block_snapshot.wrap_snapshot;
+    let tab_snapshot = &wrap_snapshot.tab_snapshot;
+    let fold_snapshot = &tab_snapshot.fold_snapshot;
+    let inlay_snapshot = &fold_snapshot.inlay_snapshot;
+    let to_buffer = |wrap_point: WrapPoint, bias: Bias| {
+        let tab_point = wrap_snapshot.to_tab_point(wrap_point);
+        let fold_point = tab_snapshot.tab_point_to_fold_point(tab_point, bias).0;
+        let inlay_point = fold_point.to_inlay_point(fold_snapshot);
+        inlay_snapshot.to_buffer_offset(inlay_snapshot.to_offset(inlay_point))
+    };
+    let wrap_row = WrapRow(wrap_row);
+    to_buffer(WrapPoint::new(wrap_row, 0), Bias::Left)
+        ..to_buffer(
+            WrapPoint::new(wrap_row, wrap_snapshot.line_len(wrap_row)),
+            Bias::Right,
+        )
+}
+
+#[derive(Default)]
+struct ControlRows(Mutex<HashMap<MultiBufferOffset, ControlRow>>);
+
+struct ControlRow {
+    range: Range<Anchor>,
+    end: MultiBufferOffset,
+    has_control: bool,
+}
+
+impl ControlRows {
+    fn edited(&self, buffer: &MultiBufferSnapshot, dirty: &[Range<MultiBufferOffset>]) -> Self {
+        let rows = self
+            .0
+            .lock()
+            .values()
+            .filter_map(|row| {
+                let start = row.range.start.to_offset(buffer);
+                let end = row.range.end.to_offset(buffer);
+                let start_point = buffer.offset_to_point(start);
+                if start_point.column != 0
+                    || start + buffer.line_len(MultiBufferRow(start_point.row)) as usize != end
+                {
+                    return None;
+                }
+                let mut touched = dirty
+                    .iter()
+                    .filter(|dirty| dirty.start <= end && start <= dirty.end)
+                    .peekable();
+                if row.has_control && touched.peek().is_some() {
+                    return None;
+                }
+                let still_clean = touched.all(|dirty| {
+                    buffer
+                        .bytes_in_range(dirty.start.max(start)..dirty.end.min(end))
+                        .all(all_grid_bytes)
+                });
+                still_clean.then(|| {
+                    (
+                        start,
+                        ControlRow {
+                            range: row.range.clone(),
+                            end,
+                            has_control: row.has_control,
+                        },
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+        Self(Mutex::new(rows))
+    }
+
+    fn contains_control(
+        &self,
+        buffer: &MultiBufferSnapshot,
+        range: Range<MultiBufferOffset>,
+    ) -> bool {
+        if range.is_empty() {
+            return false;
+        }
+        if let Some(row) = self.0.lock().get(&range.start)
+            && row.end == range.end
+        {
+            return row.has_control;
+        }
+        let has_control = !buffer.bytes_in_range(range.clone()).all(all_grid_bytes);
+        self.0.lock().insert(
+            range.start,
+            ControlRow {
+                range: buffer.anchor_before(range.start)..buffer.anchor_after(range.end),
+                end: range.end,
+                has_control,
+            },
+        );
+        has_control
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DiagnosticState {
+    underline: Option<UnderlineStyle>,
+    severity: Option<lsp::DiagnosticSeverity>,
+}
+
+impl DiagnosticState {
+    fn observe(
+        &mut self,
+        severity: Option<lsp::DiagnosticSeverity>,
+        underline: bool,
+        is_unnecessary: bool,
+        snapshot: &DisplaySnapshot,
+        editor_style: &EditorStyle,
+    ) -> Option<HighlightStyle> {
+        let highlight =
+            snapshot.observe_diagnostic_chunk(severity, underline, is_unnecessary, editor_style);
+        self.underline = highlight.as_ref().and_then(|highlight| highlight.underline);
+        self.severity = self
+            .underline
+            .and_then(|_| severity)
+            .filter(|severity| snapshot.diagnostic_severity_is_visible(*severity));
+        highlight
+    }
+}
 
 const BULLETS: &str = match std::str::from_utf8(&[b'*'; rope::Chunk::MASK_BITS]) {
     Ok(bullets) => bullets,
@@ -247,7 +472,7 @@ pub struct DisplayMap {
     /// Regions of inlays that should be highlighted.
     inlay_highlights: InlayHighlights,
     /// The semantic tokens from the language server.
-    pub semantic_token_highlights: SemanticTokensHighlights,
+    semantic_token_highlights: SemanticTokensHighlights,
     /// A container for explicitly foldable ranges, which supersede indentation based fold range suggestions.
     crease_map: CreaseMap,
     pub(crate) fold_placeholder: FoldPlaceholder,
@@ -257,6 +482,10 @@ pub struct DisplayMap {
     pub(crate) companion: Option<(WeakEntity<DisplayMap>, Entity<Companion>)>,
     lsp_folding_crease_ids: HashMap<BufferId, Vec<CreaseId>>,
     row_rulers: Arc<RowRulerCache>,
+    control_rows: Arc<ControlRows>,
+    highlight_version: usize,
+    ruler_dirt: RulerDirt,
+    ruler_old_buffer: Option<MultiBufferSnapshot>,
 }
 
 pub(crate) struct Companion {
@@ -357,6 +586,30 @@ impl HighlightStyleInterner {
     pub(crate) fn intern(&mut self, style: HighlightStyle) -> HighlightStyleId {
         HighlightStyleId(self.styles.insert_full(style).0 as u32)
     }
+
+    pub(crate) fn styles(&self) -> impl Iterator<Item = &HighlightStyle> {
+        self.styles.iter()
+    }
+}
+
+fn highlight_styles<'a>(
+    text_highlights: &'a TextHighlights,
+    inlay_highlights: &'a InlayHighlights,
+    semantic_token_highlights: &'a SemanticTokensHighlights,
+) -> impl Iterator<Item = HighlightStyle> + 'a {
+    text_highlights
+        .values()
+        .map(|highlight| highlight.0)
+        .chain(
+            inlay_highlights
+                .iter()
+                .flat_map(|(_, highlights)| highlights.iter().map(|(_, (style, _))| *style)),
+        )
+        .chain(
+            semantic_token_highlights
+                .values()
+                .flat_map(|(_, interner)| interner.styles().copied()),
+        )
 }
 
 impl ops::Index<HighlightStyleId> for HighlightStyleInterner {
@@ -428,8 +681,39 @@ impl DisplayMap {
             masked: false,
             companion: None,
             lsp_folding_crease_ids: HashMap::default(),
-            row_rulers: Arc::new(RowRulerCache::new(0, false, None)),
+            row_rulers: Arc::new(RowRulerCache::new(
+                RulerCacheVersion {
+                    tabs: 0,
+                    highlights: 0,
+                    non_text_state: 0,
+                    diagnostics_max_severity,
+                    tab_size,
+                    masked: false,
+                },
+                None,
+                |_| None,
+            )),
+            control_rows: Arc::default(),
+            highlight_version: 0,
+            ruler_dirt: RulerDirt::default(),
+            ruler_old_buffer: None,
         }
+    }
+
+    fn consume_buffer_edits(
+        &mut self,
+        buffer: &MultiBufferSnapshot,
+    ) -> Vec<text::Edit<MultiBufferOffset>> {
+        let edits = self.buffer_subscription.consume().into_inner();
+        if self.ruler_old_buffer.is_none() {
+            self.ruler_old_buffer = Some(self.inlay_map.buffer_snapshot().clone());
+        }
+        let dirty_edits = edits
+            .iter()
+            .map(|edit| buffer.anchor_before(edit.new.start)..buffer.anchor_after(edit.new.end))
+            .collect::<Vec<_>>();
+        self.mark_rulers_dirty(dirty_edits);
+        edits
     }
 
     pub(crate) fn set_companion(
@@ -470,10 +754,10 @@ impl DisplayMap {
 
         // Note, throwing away the wrap edits because we defer spacer computation to the first render.
         let snapshot = {
-            let edits = self.buffer_subscription.consume();
             let snapshot = self.buffer.read(cx).snapshot(cx);
+            let edits = self.consume_buffer_edits(&snapshot);
             let tab_size = Self::tab_size(&self.buffer, cx);
-            let (snapshot, edits) = self.inlay_map.sync(snapshot, edits.into_inner());
+            let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
             let (mut writer, snapshot, edits) = self.fold_map.write(snapshot, edits);
             let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
             let (_snapshot, _edits) = self
@@ -577,7 +861,7 @@ impl DisplayMap {
     fn sync_through_wrap(&mut self, cx: &mut App) -> (WrapSnapshot, WrapPatch) {
         let tab_size = Self::tab_size(&self.buffer, cx);
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
-        let edits = self.buffer_subscription.consume().into_inner();
+        let edits = self.consume_buffer_edits(&buffer_snapshot);
 
         let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot, edits);
         let (snapshot, edits) = self.fold_map.read(snapshot, edits);
@@ -670,10 +954,13 @@ impl DisplayMap {
                 .ok()
         });
 
+        self.refresh_row_caches(&block_snapshot);
         DisplaySnapshot {
             display_map_id: self.entity_id,
             companion_display_snapshot,
-            row_rulers: self.row_rulers_for(&block_snapshot),
+            row_rulers: self.row_rulers.clone(),
+            control_rows: self.control_rows.clone(),
+            ruled_row_snapshot: OnceLock::new(),
             block_snapshot,
             diagnostics_max_severity: self.diagnostics_max_severity,
             crease_snapshot: self.crease_map.snapshot(),
@@ -695,10 +982,13 @@ impl DisplayMap {
             .read(wrap_snapshot, wrap_edits, None)
             .snapshot;
 
+        self.refresh_row_caches(&block_snapshot);
         DisplaySnapshot {
             display_map_id: self.entity_id,
             companion_display_snapshot: None,
-            row_rulers: self.row_rulers_for(&block_snapshot),
+            row_rulers: self.row_rulers.clone(),
+            control_rows: self.control_rows.clone(),
+            ruled_row_snapshot: OnceLock::new(),
             block_snapshot,
             diagnostics_max_severity: self.diagnostics_max_severity,
             crease_snapshot: self.crease_map.snapshot(),
@@ -712,16 +1002,102 @@ impl DisplayMap {
         }
     }
 
-    fn row_rulers_for(&mut self, block_snapshot: &BlockSnapshot) -> Arc<RowRulerCache> {
-        let version = block_snapshot.wrap_snapshot.tab_snapshot.version;
-        if !self.row_rulers.matches(version, self.masked) {
-            self.row_rulers = Arc::new(RowRulerCache::new(
-                version,
-                self.masked,
-                Some(&self.row_rulers),
-            ));
+    fn refresh_row_caches(&mut self, block_snapshot: &BlockSnapshot) {
+        let tab_snapshot = &block_snapshot.wrap_snapshot.tab_snapshot;
+        let buffer = &tab_snapshot.fold_snapshot.inlay_snapshot.buffer;
+        let version = RulerCacheVersion {
+            tabs: tab_snapshot.version,
+            highlights: self.highlight_version,
+            non_text_state: buffer.non_text_state_update_count(),
+            diagnostics_max_severity: self.diagnostics_max_severity,
+            tab_size: tab_snapshot.tab_size,
+            masked: self.masked,
+        };
+        let previous_version = self.row_rulers.version();
+        if previous_version == version {
+            return;
         }
-        self.row_rulers.clone()
+        let dirt = std::mem::take(&mut self.ruler_dirt);
+        let old_buffer = self.ruler_old_buffer.take();
+        let dirty_offsets = dirt
+            .ranges
+            .iter()
+            .map(|range| range.start.to_offset(buffer)..range.end.to_offset(buffer))
+            .collect::<Vec<_>>();
+        self.control_rows = if dirt.all {
+            Arc::default()
+        } else {
+            Arc::new(self.control_rows.edited(buffer, &dirty_offsets))
+        };
+        let retain_any = !dirt.all
+            && previous_version.diagnostics_max_severity == version.diagnostics_max_severity
+            && previous_version.tab_size == version.tab_size
+            && previous_version.masked == version.masked;
+        let diagnostics_changed = previous_version.non_text_state != version.non_text_state;
+        let retain = |ruler: &RowRuler| -> Option<u32> {
+            if !retain_any {
+                return None;
+            }
+            let row_range = ruler.row_range()?;
+            let start = row_range.start.to_offset(buffer);
+            let end = row_range.end.to_offset(buffer);
+            if dirty_offsets.iter().any(|dirty| {
+                if dirty.is_empty() {
+                    start <= dirty.start && dirty.start <= end
+                } else {
+                    dirty.start < end && start < dirty.end
+                }
+            }) {
+                return None;
+            }
+            let old_buffer = old_buffer.as_ref()?;
+            let old_range =
+                row_range.start.to_offset(old_buffer)..row_range.end.to_offset(old_buffer);
+            if diagnostics_changed
+                && !same_diagnostics(old_buffer, old_range.clone(), buffer, start..end)
+            {
+                return None;
+            }
+            if ruler.uses_syntax() && !same_syntax(old_buffer, old_range, buffer, start..end) {
+                return None;
+            }
+            let wrap_row = wrap_row_for_offset(block_snapshot, start);
+            (row_buffer_range(block_snapshot, wrap_row) == (start..end)).then_some(wrap_row)
+        };
+        self.row_rulers = Arc::new(RowRulerCache::new(version, Some(&self.row_rulers), retain));
+    }
+
+    fn mark_rulers_dirty(&mut self, ranges: impl IntoIterator<Item = Range<Anchor>>) {
+        if self.ruler_dirt.all {
+            return;
+        }
+        for range in ranges {
+            if self.ruler_dirt.ranges.len() >= MAX_TRACKED_RULER_DIRT {
+                self.mark_all_rulers_dirty();
+                return;
+            }
+            self.ruler_dirt.ranges.push(range);
+        }
+    }
+
+    fn mark_rulers_dirty_in<T: ToOffset>(
+        &mut self,
+        ranges: impl IntoIterator<Item = Range<T>>,
+        buffer: &MultiBufferSnapshot,
+    ) {
+        let ranges = ranges
+            .into_iter()
+            .map(|range| {
+                buffer.anchor_before(range.start.to_offset(buffer))
+                    ..buffer.anchor_after(range.end.to_offset(buffer))
+            })
+            .collect::<Vec<_>>();
+        self.mark_rulers_dirty(ranges);
+    }
+
+    fn mark_all_rulers_dirty(&mut self) {
+        self.ruler_dirt.all = true;
+        self.ruler_dirt.ranges.clear();
     }
 
     pub fn crease_snapshot(&self) -> CreaseSnapshot {
@@ -755,8 +1131,12 @@ impl DisplayMap {
         }
 
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
-        let edits = self.buffer_subscription.consume().into_inner();
+        let edits = self.consume_buffer_edits(&buffer_snapshot);
         let tab_size = Self::tab_size(&self.buffer, cx);
+        self.mark_rulers_dirty_in(
+            creases.iter().map(|crease| crease.range().clone()),
+            &buffer_snapshot,
+        );
 
         let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot.clone(), edits);
         let (mut fold_map, snapshot, edits) = self.fold_map.write(snapshot, edits);
@@ -830,7 +1210,12 @@ impl DisplayMap {
         cx: &mut Context<Self>,
     ) {
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let edits = self.buffer_subscription.consume().into_inner();
+        let ranges = ranges
+            .into_iter()
+            .map(|range| range.start.to_offset(&snapshot)..range.end.to_offset(&snapshot))
+            .collect::<Vec<_>>();
+        self.mark_rulers_dirty_in(ranges.iter().cloned(), &snapshot);
+        let edits = self.consume_buffer_edits(&snapshot);
         let tab_size = Self::tab_size(&self.buffer, cx);
 
         let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
@@ -864,7 +1249,8 @@ impl DisplayMap {
             .into_iter()
             .map(|range| range.start.to_offset(&snapshot)..range.end.to_offset(&snapshot))
             .collect::<Vec<_>>();
-        let edits = self.buffer_subscription.consume().into_inner();
+        self.mark_rulers_dirty_in(offset_ranges.iter().cloned(), &snapshot);
+        let edits = self.consume_buffer_edits(&snapshot);
         let tab_size = Self::tab_size(&self.buffer, cx);
 
         let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
@@ -1176,6 +1562,19 @@ impl DisplayMap {
         cx: &App,
     ) {
         let multi_buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        let previous = self.text_highlights.get(&key);
+        if affects_shaping(&style) || previous.is_some_and(|previous| affects_shaping(&previous.0))
+        {
+            self.highlight_version += 1;
+            let previous_hull = previous
+                .filter(|previous| !merge || previous.0 != style)
+                .and_then(|previous| anchor_hull(&previous.1, &multi_buffer_snapshot));
+            let dirty = previous_hull
+                .into_iter()
+                .chain(anchor_hull(&ranges, &multi_buffer_snapshot))
+                .collect::<Vec<_>>();
+            self.mark_rulers_dirty(dirty);
+        }
         match Arc::make_mut(&mut self.text_highlights).entry(key) {
             Entry::Occupied(mut slot) => match Arc::get_mut(slot.get_mut()) {
                 Some((_, previous_ranges)) if merge => {
@@ -1211,6 +1610,19 @@ impl DisplayMap {
         highlights: Vec<InlayHighlight>,
         style: HighlightStyle,
     ) {
+        let previous_affects_shaping = self.inlay_highlights.get(&key).is_some_and(|highlights| {
+            highlights
+                .iter()
+                .any(|(_, (style, _))| affects_shaping(style))
+        });
+        if affects_shaping(&style) || previous_affects_shaping {
+            self.highlight_version += 1;
+            let dirty = highlights
+                .iter()
+                .map(|highlight| highlight.inlay_position..highlight.inlay_position)
+                .collect::<Vec<_>>();
+            self.mark_rulers_dirty(dirty);
+        }
         for highlight in highlights {
             let update = self.inlay_highlights.update(&key, |highlights| {
                 highlights.insert(highlight.inlay, (style, highlight.clone()))
@@ -1247,27 +1659,74 @@ impl DisplayMap {
         self.semantic_token_highlights.iter()
     }
 
+    pub(crate) fn highlight_styles(&self) -> impl Iterator<Item = HighlightStyle> + '_ {
+        highlight_styles(
+            &self.text_highlights,
+            &self.inlay_highlights,
+            &self.semantic_token_highlights,
+        )
+    }
+
     pub fn clear_highlights(&mut self, key: HighlightKey) -> bool {
-        let mut cleared = Arc::make_mut(&mut self.text_highlights)
-            .remove(&key)
-            .is_some();
-        cleared |= self.inlay_highlights.remove(&key).is_some();
-        cleared
+        let removed_text = self
+            .text_highlights
+            .contains_key(&key)
+            .then(|| Arc::make_mut(&mut self.text_highlights).remove(&key))
+            .flatten();
+        let removed_inlays = self.inlay_highlights.remove(&key);
+        self.mark_removed_highlights_dirty(removed_text.as_deref(), removed_inlays.as_ref());
+        removed_text.is_some() || removed_inlays.is_some()
     }
 
     pub fn clear_highlights_with(&mut self, f: &mut dyn FnMut(&HighlightKey) -> bool) -> bool {
         let mut cleared = false;
-        Arc::make_mut(&mut self.text_highlights).retain(|k, _| {
+        let mut removed_text = Vec::new();
+        let mut removed_inlays = Vec::new();
+        Arc::make_mut(&mut self.text_highlights).retain(|k, highlights| {
             let b = !f(k);
             cleared |= b;
+            if !b {
+                removed_text.push(highlights.clone());
+            }
             b
         });
-        self.inlay_highlights.retain(|k, _| {
+        self.inlay_highlights.retain(|k, highlights| {
             let b = !f(k);
             cleared |= b;
+            if !b {
+                removed_inlays.push(highlights.clone());
+            }
             b
         });
+        for highlights in &removed_text {
+            self.mark_removed_highlights_dirty(Some(highlights), None);
+        }
+        for highlights in &removed_inlays {
+            self.mark_removed_highlights_dirty(None, Some(highlights));
+        }
         cleared
+    }
+
+    fn mark_removed_highlights_dirty(
+        &mut self,
+        text: Option<&(HighlightStyle, Vec<Range<Anchor>>)>,
+        inlays: Option<&TreeMap<InlayId, (HighlightStyle, InlayHighlight)>>,
+    ) {
+        let dirty = text
+            .filter(|(style, _)| affects_shaping(style))
+            .into_iter()
+            .flat_map(|(_, ranges)| ranges.iter().cloned())
+            .chain(inlays.into_iter().flat_map(|inlays| {
+                inlays
+                    .iter()
+                    .filter(|(_, (style, _))| affects_shaping(style))
+                    .map(|(_, (_, highlight))| highlight.inlay_position..highlight.inlay_position)
+            }))
+            .collect::<Vec<_>>();
+        if !dirty.is_empty() {
+            self.highlight_version += 1;
+            self.mark_rulers_dirty(dirty);
+        }
     }
 
     pub fn set_font(&self, font: Font, font_size: Pixels, cx: &mut Context<Self>) -> bool {
@@ -1289,10 +1748,11 @@ impl DisplayMap {
     pub fn update_fold_widths(
         &mut self,
         widths: impl IntoIterator<Item = (ChunkRendererId, Pixels)>,
+        renderer_metrics_key: u64,
         cx: &mut Context<Self>,
     ) -> bool {
         let snapshot = self.buffer.read(cx).snapshot(cx);
-        let edits = self.buffer_subscription.consume().into_inner();
+        let edits = self.consume_buffer_edits(&snapshot);
         let tab_size = Self::tab_size(&self.buffer, cx);
 
         let (snapshot, edits) = self.inlay_map.sync(snapshot, edits);
@@ -1306,8 +1766,11 @@ impl DisplayMap {
         let widths = widths.into_iter().collect::<Vec<_>>();
         let ruler_widths_changed = self
             .row_rulers
-            .update_renderer_widths(widths.iter().copied());
+            .update_renderer_widths(widths.iter().copied(), renderer_metrics_key);
         let (snapshot, edits) = fold_map.update_fold_widths(widths);
+        if !edits.is_empty() {
+            self.mark_all_rulers_dirty();
+        }
         let widths_changed = ruler_widths_changed || !edits.is_empty();
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
         let (self_new_wrap_snapshot, self_new_wrap_edits) = self
@@ -1334,8 +1797,17 @@ impl DisplayMap {
         if to_remove.is_empty() && to_insert.is_empty() {
             return;
         }
+        self.row_rulers.remove_renderer_widths(to_remove);
+        let dirty = self
+            .inlay_map
+            .current_inlays()
+            .filter(|inlay| to_remove.contains(&inlay.id))
+            .chain(&to_insert)
+            .map(|inlay| inlay.position..inlay.position)
+            .collect::<Vec<_>>();
+        self.mark_rulers_dirty(dirty);
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
-        let edits = self.buffer_subscription.consume().into_inner();
+        let edits = self.consume_buffer_edits(&buffer_snapshot);
         let tab_size = Self::tab_size(&self.buffer, cx);
 
         let companion_wrap_data = self.companion.as_ref().and_then(|(companion_dm, _)| {
@@ -1417,7 +1889,47 @@ impl DisplayMap {
     }
 
     pub fn invalidate_semantic_highlights(&mut self, buffer_id: BufferId) {
-        Arc::make_mut(&mut self.semantic_token_highlights).remove(&buffer_id);
+        if let Some((_, interner)) =
+            Arc::make_mut(&mut self.semantic_token_highlights).remove(&buffer_id)
+        {
+            self.mark_semantic_styles_dirty(&interner);
+        }
+    }
+
+    pub(crate) fn clear_semantic_highlights(&mut self) {
+        if self
+            .semantic_token_highlights
+            .values()
+            .any(|(_, interner)| interner.styles().any(affects_shaping))
+        {
+            self.highlight_version += 1;
+            self.mark_all_rulers_dirty();
+        }
+        match Arc::get_mut(&mut self.semantic_token_highlights) {
+            Some(highlights) => highlights.clear(),
+            None => self.semantic_token_highlights = Arc::new(Default::default()),
+        }
+    }
+
+    pub(crate) fn set_semantic_highlights(
+        &mut self,
+        buffer_id: BufferId,
+        highlights: Arc<[SemanticTokenHighlight]>,
+        interner: Arc<HighlightStyleInterner>,
+    ) {
+        self.mark_semantic_styles_dirty(&interner);
+        if let Some((_, previous)) = Arc::make_mut(&mut self.semantic_token_highlights)
+            .insert(buffer_id, (highlights, interner))
+        {
+            self.mark_semantic_styles_dirty(&previous);
+        }
+    }
+
+    fn mark_semantic_styles_dirty(&mut self, interner: &HighlightStyleInterner) {
+        if interner.styles().any(affects_shaping) {
+            self.highlight_version += 1;
+            self.mark_all_rulers_dirty();
+        }
     }
 }
 
@@ -1457,17 +1969,6 @@ pub struct HighlightedChunk<'a> {
 }
 
 impl<'a> HighlightedChunk<'a> {
-    pub(crate) fn without_font_styles(self) -> Self {
-        Self {
-            style: self.style.map(|style| HighlightStyle {
-                font_weight: None,
-                font_style: None,
-                ..style
-            }),
-            ..self
-        }
-    }
-
     #[instrument(skip_all)]
     fn highlight_invisibles(
         self,
@@ -1589,6 +2090,18 @@ fn mask_chunks<'a>(chunks: impl Iterator<Item = Chunk<'a>>) -> impl Iterator<Ite
     })
 }
 
+fn font_is_grid_exact(
+    text_system: &WindowTextSystem,
+    font: &Font,
+    font_size: Pixels,
+    cell_width: Pixels,
+) -> bool {
+    let font_id = text_system.resolve_font(font);
+    text_system.ascii_shaping_preserves_advances(font)
+        && (0x20u8..=0x7E)
+            .all(|byte| text_system.layout_width(font_id, font_size, byte as char) == cell_width)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GridCell {
     pub width: Pixels,
@@ -1598,13 +2111,44 @@ pub struct GridCell {
 impl GridCell {
     pub(crate) const FIT_TOLERANCE: ScrollPixelOffset = 0.5;
 
-    pub fn measure(text_system: &WindowTextSystem, font: &Font, font_size: Pixels) -> Self {
-        let font_id = text_system.resolve_font(font);
+    pub fn measure(
+        text_system: &WindowTextSystem,
+        style: &EditorStyle,
+        highlight_styles: impl Iterator<Item = HighlightStyle>,
+        font_size: Pixels,
+    ) -> Self {
+        let base = style.text.font();
+        let font_id = text_system.resolve_font(&base);
         let width = text_system.em_layout_width(font_id, font_size);
+        let mut variants = vec![(base.weight, base.style)];
+        let styles = style
+            .syntax
+            .highlights()
+            .copied()
+            .chain([
+                style.inlay_hints_style,
+                style.edit_prediction_styles.insertion,
+                style.edit_prediction_styles.whitespace,
+            ])
+            .chain(highlight_styles);
+        for highlight in styles {
+            let variant = (
+                highlight.font_weight.unwrap_or(base.weight),
+                highlight.font_style.unwrap_or(base.style),
+            );
+            if !variants.contains(&variant) {
+                variants.push(variant);
+            }
+        }
         let monospace = width > Pixels::ZERO
-            && ['i', 'W']
-                .into_iter()
-                .all(|probe| text_system.layout_width(font_id, font_size, probe) == width);
+            && variants.into_iter().all(|(weight, style)| {
+                let font = Font {
+                    weight,
+                    style,
+                    ..base.clone()
+                };
+                font_is_grid_exact(text_system, &font, font_size, width)
+            });
         Self { width, monospace }
     }
 
@@ -1691,12 +2235,16 @@ impl RuledRow {
             .columns_for_x_range(left - visible_width / 2.0..left + visible_width * 1.5)
     }
 
-    pub fn chunk_columns(&self, columns: Range<u32>) -> impl Iterator<Item = Range<u32>> + '_ {
-        self.ruler.chunk_ranges(columns)
+    pub fn render_pieces(&self, columns: Range<u32>) -> impl Iterator<Item = RenderPiece> + '_ {
+        self.ruler.render_pieces(columns)
     }
 
-    pub fn chunk_width(&self, columns: Range<u32>) -> ScrollPixelOffset {
-        self.ruler.width_of_chunks(columns)
+    pub fn x_range_for_columns(&self, columns: Range<u32>) -> Range<ScrollPixelOffset> {
+        self.ruler.x_range_for_columns(columns)
+    }
+
+    pub fn is_rtl(&self) -> bool {
+        self.ruler.is_rtl()
     }
 
     fn x_for_column(&self, column: u32) -> ScrollPixelOffset {
@@ -1737,6 +2285,10 @@ impl WindowedRowGeometry {
         }
     }
 
+    pub fn is_ruled(&self) -> bool {
+        self.ruled.is_some()
+    }
+
     pub fn row_len(&self) -> u32 {
         self.row_len
     }
@@ -1750,12 +2302,25 @@ impl WindowedRowGeometry {
     }
 
     pub fn start_x(&self) -> ScrollPixelOffset {
-        self.column_x(self.window.start)
+        match &self.ruled {
+            Some(ruled) => ruled.x_range_for_columns(self.window.clone()).start,
+            None => self.column_x(self.window.start),
+        }
+    }
+
+    pub fn end_x(&self) -> ScrollPixelOffset {
+        match &self.ruled {
+            Some(ruled) => ruled.x_range_for_columns(self.window.clone()).end,
+            None => self.column_x(self.window.end),
+        }
     }
 
     pub fn width(&self, shaped_width: Pixels) -> ScrollPixelOffset {
-        self.column_x(self.row_len)
-            .max(self.start_x() + ScrollPixelOffset::from(shaped_width))
+        let row_width = self.column_x(self.row_len);
+        if self.ruled.is_some() {
+            return row_width;
+        }
+        row_width.max(self.start_x() + ScrollPixelOffset::from(shaped_width))
     }
 
     pub fn column_x(&self, column: u32) -> ScrollPixelOffset {
@@ -1778,12 +2343,40 @@ impl WindowedRowGeometry {
         column_from_usize(column as usize).min(self.row_len)
     }
 
-    pub fn column_before_window_for_x(&self, x: ScrollPixelOffset) -> u32 {
-        self.column_for_x(x).min(self.window.start)
+    pub fn reaches_left_edge(&self) -> bool {
+        if self.is_rtl() {
+            self.window.end >= self.row_len
+        } else {
+            self.window.start == 0
+        }
     }
 
-    pub fn column_after_window_for_x(&self, x: ScrollPixelOffset) -> u32 {
-        self.column_for_x(x).max(self.window.end)
+    pub fn reaches_right_edge(&self) -> bool {
+        if self.is_rtl() {
+            self.window.start == 0
+        } else {
+            self.window.end >= self.row_len
+        }
+    }
+
+    pub fn column_left_of_window_for_x(&self, x: ScrollPixelOffset) -> u32 {
+        if self.is_rtl() {
+            self.column_for_x(x).max(self.window.end)
+        } else {
+            self.column_for_x(x).min(self.window.start)
+        }
+    }
+
+    pub fn column_right_of_window_for_x(&self, x: ScrollPixelOffset) -> u32 {
+        if self.is_rtl() {
+            self.column_for_x(x).min(self.window.start)
+        } else {
+            self.column_for_x(x).max(self.window.end)
+        }
+    }
+
+    fn is_rtl(&self) -> bool {
+        self.ruled.as_ref().is_some_and(RuledRow::is_rtl)
     }
 }
 
@@ -1813,7 +2406,7 @@ impl RowLayout {
             Self::Windowed { geometry, shaped } => {
                 let window = geometry.window();
                 let column = column_from_usize(index);
-                if column >= window.start && column <= window.end {
+                if !window.is_empty() && column >= window.start && column <= window.end {
                     geometry.start_x()
                         + ScrollPixelOffset::from(
                             shaped.x_for_index((column - window.start) as usize),
@@ -1832,11 +2425,11 @@ impl RowLayout {
                 let start_x = geometry.start_x();
                 let window = geometry.window();
                 if x < start_x {
-                    geometry.column_before_window_for_x(x) as usize
+                    geometry.column_left_of_window_for_x(x) as usize
                 } else if x <= start_x + ScrollPixelOffset::from(shaped.width) {
                     window.start as usize + shaped.closest_index_for_x(Pixels::from(x - start_x))
                 } else {
-                    geometry.column_after_window_for_x(x) as usize
+                    geometry.column_right_of_window_for_x(x) as usize
                 }
             }
         }
@@ -1850,6 +2443,8 @@ pub struct DisplaySnapshot {
     pub crease_snapshot: CreaseSnapshot,
     block_snapshot: BlockSnapshot,
     row_rulers: Arc<RowRulerCache>,
+    control_rows: Arc<ControlRows>,
+    ruled_row_snapshot: OnceLock<Arc<DisplaySnapshot>>,
     text_highlights: TextHighlights,
     inlay_highlights: InlayHighlights,
     semantic_token_highlights: SemanticTokensHighlights,
@@ -1955,6 +2550,34 @@ impl DisplaySnapshot {
         &self.block_snapshot.wrap_snapshot
     }
 
+    pub(crate) fn highlight_styles(&self) -> impl Iterator<Item = HighlightStyle> + '_ {
+        highlight_styles(
+            &self.text_highlights,
+            &self.inlay_highlights,
+            &self.semantic_token_highlights,
+        )
+    }
+
+    fn observe_diagnostic_chunk(
+        &self,
+        severity: Option<lsp::DiagnosticSeverity>,
+        underline: bool,
+        is_unnecessary: bool,
+        editor_style: &EditorStyle,
+    ) -> Option<HighlightStyle> {
+        let severity = severity.filter(|severity| self.diagnostic_severity_is_visible(*severity));
+        severity.map(|severity| HighlightStyle {
+            fade_out: is_unnecessary.then_some(editor_style.unnecessary_code_fade),
+            underline: self.diagnostic_underline_style(
+                severity,
+                underline,
+                is_unnecessary,
+                editor_style,
+            ),
+            ..Default::default()
+        })
+    }
+
     pub fn has_soft_wraps(&self) -> bool {
         self.wrap_snapshot().has_soft_wraps()
     }
@@ -1998,19 +2621,6 @@ impl DisplaySnapshot {
 
     pub fn is_empty(&self) -> bool {
         self.buffer_snapshot().len() == MultiBufferOffset(0)
-    }
-
-    /// Returns whether tree-sitter syntax highlighting should be used.
-    /// Returns `false` if any buffer with semantic token highlights has the "full" mode setting,
-    /// meaning LSP semantic tokens should replace tree-sitter highlighting.
-    pub fn use_tree_sitter_for_syntax(&self, position: DisplayRow, cx: &App) -> bool {
-        let position = DisplayPoint::new(position, 0);
-        let Some((buffer_snapshot, ..)) = self.point_to_buffer_point(position.to_point(self))
-        else {
-            return false;
-        };
-        let settings = LanguageSettings::for_buffer_snapshot(&buffer_snapshot, None, cx);
-        settings.semantic_tokens.use_tree_sitter()
     }
 
     pub fn shows_trailing_whitespace(&self, position: DisplayRow, cx: &App) -> bool {
@@ -2230,7 +2840,12 @@ impl DisplaySnapshot {
         };
         if self.is_long_unwrapped_row(point.row()) {
             let start = self.block_snapshot.to_wrap_point(point.0, Bias::Left);
-            let end = WrapPoint::new(start.row(), self.wrap_snapshot().line_len(start.row()));
+            let wrap_snapshot = self.wrap_snapshot();
+            let end = if start.row() < wrap_snapshot.max_point().row() {
+                WrapPoint::new(start.row() + WrapRow(1), 0)
+            } else {
+                WrapPoint::new(start.row(), wrap_snapshot.line_len(start.row()))
+            };
             let chunks =
                 self.wrap_snapshot()
                     .chunks(start..end, language_aware, Highlights::default());
@@ -2361,7 +2976,41 @@ impl DisplaySnapshot {
             },
         );
         let chunks = self.mask_chunks_if_needed(chunks);
-        self.map_to_highlighted_chunks(chunks, editor_style)
+        let seed = if range.start.column() > 0 {
+            self.diagnostic_state_before(range.start, language_aware, editor_style)
+        } else {
+            DiagnosticState::default()
+        };
+        self.map_to_highlighted_chunks_from(chunks, editor_style, seed)
+    }
+
+    fn diagnostic_state_before(
+        &self,
+        point: DisplayPoint,
+        language_aware: LanguageAwareStyling,
+        editor_style: &EditorStyle,
+    ) -> DiagnosticState {
+        let buffer = self.buffer_snapshot();
+        let inlay_offset = self.display_point_to_inlay_offset(point, Bias::Left);
+        let end = self.inlay_snapshot().to_buffer_offset(inlay_offset);
+        let mut state = DiagnosticState::default();
+        let Some(start) = end.0.checked_sub(1) else {
+            return state;
+        };
+        let start = buffer.clip_offset(MultiBufferOffset(start), Bias::Left);
+        if self.fold_snapshot().intersects_fold(start) {
+            return state;
+        }
+        for chunk in buffer.chunks(start..end, language_aware) {
+            state.observe(
+                chunk.diagnostic_severity,
+                chunk.underline,
+                chunk.is_unnecessary,
+                self,
+                editor_style,
+            );
+        }
+        state
     }
 
     fn map_to_highlighted_chunks<'a>(
@@ -2369,12 +3018,18 @@ impl DisplaySnapshot {
         chunks: impl Iterator<Item = Chunk<'a>> + 'a,
         editor_style: &'a EditorStyle,
     ) -> impl Iterator<Item = HighlightedChunk<'a>> + 'a {
+        self.map_to_highlighted_chunks_from(chunks, editor_style, DiagnosticState::default())
+    }
+
+    fn map_to_highlighted_chunks_from<'a>(
+        &'a self,
+        chunks: impl Iterator<Item = Chunk<'a>> + 'a,
+        editor_style: &'a EditorStyle,
+        mut diagnostic_state: DiagnosticState,
+    ) -> impl Iterator<Item = HighlightedChunk<'a>> + 'a {
         chunks.flat_map({
             // track the current underline style so that we can apply it to
             // inlay hints within the diagnostic's span
-            let mut current_diagnostic_underline: Option<UnderlineStyle> = None;
-            let mut current_diagnostic_severity: Option<lsp::DiagnosticSeverity> = None;
-
             move |chunk| {
                 let syntax_highlight_style = chunk
                     .syntax_highlight_id
@@ -2400,33 +3055,21 @@ impl DisplaySnapshot {
 
                 let (diagnostic_highlight, diagnostic_severity) = if chunk.is_inlay {
                     (
-                        current_diagnostic_underline.map(|underline| HighlightStyle {
+                        diagnostic_state.underline.map(|underline| HighlightStyle {
                             underline: Some(underline),
                             ..Default::default()
                         }),
-                        current_diagnostic_severity,
+                        diagnostic_state.severity,
                     )
                 } else {
-                    let severity = chunk
-                        .diagnostic_severity
-                        .filter(|severity| self.diagnostic_severity_is_visible(*severity));
-                    let highlight = severity.map(|severity| HighlightStyle {
-                        fade_out: chunk
-                            .is_unnecessary
-                            .then_some(editor_style.unnecessary_code_fade),
-                        underline: self.diagnostic_underline_style(
-                            severity,
-                            chunk.underline,
-                            chunk.is_unnecessary,
-                            editor_style,
-                        ),
-                        ..Default::default()
-                    });
-
-                    current_diagnostic_underline = highlight.as_ref().and_then(|h| h.underline);
-                    current_diagnostic_severity =
-                        current_diagnostic_underline.and_then(|_| severity);
-                    (highlight, current_diagnostic_severity)
+                    let highlight = diagnostic_state.observe(
+                        chunk.diagnostic_severity,
+                        chunk.underline,
+                        chunk.is_unnecessary,
+                        self,
+                        editor_style,
+                    );
+                    (highlight, diagnostic_state.severity)
                 };
 
                 let style = [
@@ -2534,22 +3177,37 @@ impl DisplaySnapshot {
         let row_width = ScrollPixelOffset::from(cell.width) * row_len as ScrollPixelOffset;
         let window = viewport.aligned(row_width, cell).shaping_window(row_len);
         let shaped = shaper.layout_columns(self, display_row, window.clone());
-        cell.fits(&window, shaped.width).then_some((window, shaped))
+        if !cell.fits(&window, shaped.width) {
+            debug_panic!(
+                "grid-exact fonts must shape {} columns to {} px, got {:?}",
+                window.len(),
+                f64::from(cell.width) * window.len() as f64,
+                shaped.width
+            );
+            return None;
+        }
+        Some((window, shaped))
+    }
+
+    fn wrap_row(&self, display_row: DisplayRow) -> u32 {
+        self.block_snapshot
+            .to_wrap_point(DisplayPoint::new(display_row, 0).0, Bias::Left)
+            .row()
+            .0
     }
 
     pub fn ruled_row(&self, display_row: DisplayRow, shaper: RulerShaper) -> RuledRow {
-        let wrap_row = self
-            .block_snapshot
-            .to_wrap_point(DisplayPoint::new(display_row, 0).0, Bias::Left)
-            .row()
-            .0;
+        let wrap_row = self.wrap_row(display_row);
         let ruler = self
             .row_rulers
             .get_or_build(wrap_row, &shaper, |previous, renderer_widths| {
                 RowRuler::new(self, display_row, &shaper, previous, renderer_widths)
             });
         RuledRow {
-            snapshot: Arc::new(self.clone()),
+            snapshot: self
+                .ruled_row_snapshot
+                .get_or_init(|| Arc::new(self.clone()))
+                .clone(),
             row: display_row,
             ruler,
             shaper,
@@ -2572,21 +3230,28 @@ impl DisplaySnapshot {
         }
         let inlay_range = fold_range.start.to_inlay_point(fold_snapshot)
             ..fold_range.end.to_inlay_point(fold_snapshot);
-        let buffer_range = self.inlay_snapshot().to_buffer_point(inlay_range.start)
-            ..self.inlay_snapshot().to_buffer_point(inlay_range.end);
+        let inlay_snapshot = self.inlay_snapshot();
+        let buffer_range = inlay_snapshot.to_buffer_point(inlay_range.start)
+            ..inlay_snapshot.to_buffer_point(inlay_range.end);
+        let buffer = self.buffer_snapshot();
+        let buffer_offsets =
+            buffer.point_to_offset(buffer_range.start)..buffer.point_to_offset(buffer_range.end);
         fold_snapshot.folds_in_range(buffer_range).next().is_none()
-            && !self.inlay_snapshot().has_rendered_inlays(inlay_range)
+            && !inlay_snapshot.has_inlays_matching(inlay_range, |inlay, text_range| {
+                has_chunk_renderer(inlay)
+                    || !inlay
+                        .text()
+                        .chunks_in_range(text_range)
+                        .all(|chunk| all_grid_bytes(chunk.as_bytes()))
+            })
+            && !self.control_rows.contains_control(buffer, buffer_offsets)
     }
 
     #[instrument(skip_all)]
     pub fn layout_row(&self, display_row: DisplayRow, details: &TextLayoutDetails) -> RowLayout {
-        let language_aware = LanguageAwareStyling {
-            tree_sitter: false,
-            diagnostics: false,
-        };
         let cell = details.grid_cell();
         if let Some(row_len) = self.long_unwrapped_row_len(display_row) {
-            let shaper = details.ruler_shaper();
+            let shaper = details.ruler_shaper(self, display_row);
             let viewport = details.horizontal_viewport(self);
             if let Some((window, shaped)) =
                 self.grid_window(display_row, row_len, &viewport, cell, &shaper)
@@ -2605,7 +3270,7 @@ impl DisplaySnapshot {
 
         let chunks = self.highlighted_chunks(
             display_row..display_row.next_row(),
-            language_aware,
+            details.language_aware(self, display_row),
             &details.editor_style,
         );
         RowLayout::Shaped(details.shape_row_text(chunks))
@@ -2633,27 +3298,30 @@ impl DisplaySnapshot {
     #[instrument(skip_all)]
     pub fn grapheme_at(&self, mut point: DisplayPoint) -> Option<SharedString> {
         point = DisplayPoint(self.block_snapshot.clip_point(point.0, Bias::Left));
-        let chars = self
-            .text_chunks_from(point)
-            .flat_map(str::chars)
-            .take_while({
-                let mut prev = false;
-                move |char| {
-                    let now = char.is_ascii();
-                    let end = char.is_ascii() && (char.is_ascii_whitespace() || prev);
-                    prev = now;
-                    !end
+        let mut chars = self.text_chunks_from(point).flat_map(str::chars);
+        let mut grapheme = String::from(chars.next()?);
+        let mut cursor = GraphemeCursor::new(0, usize::MAX, true);
+        loop {
+            match cursor.next_boundary(&grapheme, 0) {
+                Ok(Some(boundary)) => {
+                    grapheme.truncate(boundary);
+                    break;
                 }
-            });
-        chars.collect::<String>().graphemes(true).next().map(|s| {
-            if let Some(invisible) = s.chars().next().filter(|&c| is_invisible(c)) {
-                replacement(invisible).map_or_else(|| s.to_owned().into(), SharedString::from)
-            } else if s == "\n" {
-                " ".into()
-            } else {
-                s.to_owned().into()
+                Err(GraphemeIncomplete::NextChunk) => match chars.next() {
+                    Some(char) => grapheme.push(char),
+                    None => break,
+                },
+                Ok(None) | Err(_) => break,
             }
-        })
+        }
+        let grapheme = SharedString::from(grapheme);
+        if let Some(invisible) = grapheme.chars().next().filter(|&c| is_invisible(c)) {
+            Some(replacement(invisible).map_or(grapheme, SharedString::from))
+        } else if grapheme == "\n" {
+            Some(" ".into())
+        } else {
+            Some(grapheme)
+        }
     }
 
     pub fn buffer_chars_at(
@@ -3497,50 +4165,33 @@ pub mod tests {
 
             let mut masked_snapshot = snapshot.clone();
             masked_snapshot.masked = true;
-            let text = snapshot.text();
-            let masked_text = masked_snapshot.text();
-            assert_eq!(
-                masked_text.split('\n').count(),
-                text.split('\n').count(),
-                "masking must preserve display row structure"
-            );
-            for (masked_line, line) in masked_text.split('\n').zip(text.split('\n')) {
-                assert_eq!(
-                    masked_line,
-                    "*".repeat(line.chars().count()),
-                    "masking must emit one bullet per char of {line:?}"
-                );
-            }
-            let masked_chunks = masked_snapshot.chunks(
+            let expected_masked_text = snapshot
+                .text()
+                .split('\n')
+                .map(|line| "*".repeat(line.chars().count()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(masked_snapshot.text(), expected_masked_text);
+            for chunk in masked_snapshot.chunks(
                 DisplayRow(0)..masked_snapshot.max_point().row().next_row(),
                 LanguageAwareStyling {
                     tree_sitter: false,
                     diagnostics: false,
                 },
                 HighlightStyles::default(),
-            );
-            for chunk in masked_chunks {
-                let mut expected_chars = 0u128;
-                let mut expected_newlines = 0u128;
-                for (ix, c) in chunk.text.char_indices() {
-                    expected_chars |= 1 << ix;
-                    if c == '\n' {
-                        expected_newlines |= 1 << ix;
-                    }
-                }
+            ) {
+                let newlines = chunk
+                    .text
+                    .match_indices('\n')
+                    .fold(0u128, |newlines, (ix, _)| newlines | 1 << ix);
                 assert_eq!(
-                    chunk.tabs, 0,
-                    "masked chunk {:?} must have no tabs",
-                    chunk.text
-                );
-                assert_eq!(
-                    chunk.chars, expected_chars,
-                    "masked chunk {:?} has an inconsistent chars bitmask",
-                    chunk.text
-                );
-                assert_eq!(
-                    chunk.newlines, expected_newlines,
-                    "masked chunk {:?} has an inconsistent newlines bitmask",
+                    (chunk.tabs, chunk.chars, chunk.newlines),
+                    (
+                        0,
+                        1u128.unbounded_shl(chunk.text.len() as u32).wrapping_sub(1),
+                        newlines
+                    ),
+                    "masked chunk {:?}",
                     chunk.text
                 );
             }
@@ -4286,704 +4937,6 @@ pub mod tests {
     }
 
     #[gpui::test]
-    async fn test_highlighted_chunks_in_range_masks_redacted_text(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| init_test(cx, &|_| {}));
-
-        let long_len = MAX_LINE_LEN * 2;
-        let buffer = cx.new(|cx| Buffer::local(format!("{}\nsecret", "x".repeat(long_len)), cx));
-        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-        let map = cx.new(|cx| {
-            DisplayMap::new(
-                buffer,
-                font("Helvetica"),
-                px(14.0),
-                None,
-                1,
-                1,
-                FoldPlaceholder::test(),
-                DiagnosticSeverity::Warning,
-                cx,
-            )
-        });
-        let snapshot = cx.update(|cx| {
-            map.update(cx, |map, cx| {
-                map.masked = true;
-                map.snapshot(cx)
-            })
-        });
-        let style = EditorStyle::default();
-        let language_aware = LanguageAwareStyling {
-            tree_sitter: false,
-            diagnostics: false,
-        };
-        let chunks_text = |range: Range<DisplayPoint>| {
-            snapshot
-                .highlighted_chunks_in_range(range, language_aware, &style)
-                .map(|chunk| chunk.text)
-                .collect::<String>()
-        };
-
-        let window_start = long_len as u32 - 200;
-        assert_eq!(
-            chunks_text(
-                DisplayPoint::new(DisplayRow(0), window_start)
-                    ..DisplayPoint::new(DisplayRow(0), window_start + 10)
-            ),
-            "*".repeat(10)
-        );
-        assert_eq!(
-            chunks_text(
-                DisplayPoint::new(DisplayRow(0), long_len as u32 - 2)
-                    ..DisplayPoint::new(DisplayRow(1), 3)
-            ),
-            "**\n***"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_highlighted_chunks_in_range_keeps_exact_endpoints(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            init_test(cx, &|settings| {
-                settings.project.all_languages.defaults.tab_size = NonZeroU32::new(128);
-            })
-        });
-        let style = EditorStyle::default();
-        let language_aware = LanguageAwareStyling {
-            tree_sitter: false,
-            diagnostics: false,
-        };
-
-        let text = format!("{}\t{}", "x".repeat(79), "y".repeat(3_000));
-        let snapshot = build_snapshot(&text, cx);
-        assert_eq!(snapshot.line_len(DisplayRow(0)), 79 + 49 + 3_000);
-        let chunks_text = |snapshot: &DisplaySnapshot, columns: Range<u32>| {
-            snapshot
-                .highlighted_chunks_in_range(
-                    DisplayPoint::new(DisplayRow(0), columns.start)
-                        ..DisplayPoint::new(DisplayRow(0), columns.end),
-                    language_aware,
-                    &style,
-                )
-                .map(|chunk| chunk.text)
-                .collect::<String>()
-        };
-        assert_eq!(
-            chunks_text(&snapshot, 100..350),
-            format!("{}{}", " ".repeat(28), "y".repeat(222))
-        );
-        assert_eq!(
-            chunks_text(&snapshot, 50..100),
-            format!("{}{}", "x".repeat(29), " ".repeat(21))
-        );
-        assert_eq!(chunks_text(&snapshot, 90..110), " ".repeat(20));
-
-        let text = format!("{}Z", "x".repeat(2_047));
-        let mut snapshot = build_snapshot(&text, cx);
-        snapshot.clip_at_line_ends = true;
-        assert_eq!(
-            chunks_text(&snapshot, 1_798..2_048),
-            format!("{}Z", "x".repeat(249))
-        );
-    }
-
-    #[gpui::test]
-    async fn test_is_windowed_row_requires_exact_grid(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| init_test(cx, &|_| {}));
-        let monospace = GridCell {
-            width: px(10.),
-            monospace: true,
-        };
-        let proportional = GridCell {
-            width: px(10.),
-            monospace: false,
-        };
-
-        let long_len = MAX_LINE_LEN * 2;
-        let text = format!(
-            "{}\n{}\t{}\n{}\nshort\n{}\n{}",
-            "x".repeat(long_len),
-            "x".repeat(30),
-            "y".repeat(long_len),
-            "é".repeat(long_len),
-            "f".repeat(long_len),
-            "r".repeat(long_len)
-        );
-        let buffer = cx.update(|cx| MultiBuffer::build_simple(&text, cx));
-        let buffer_snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
-        let map = cx.new(|cx| {
-            DisplayMap::new(
-                buffer,
-                test_font(),
-                px(14.),
-                None,
-                1,
-                1,
-                FoldPlaceholder::test(),
-                DiagnosticSeverity::Warning,
-                cx,
-            )
-        });
-        map.update(cx, |map, cx| {
-            let fold_row_start = text.find("fff").unwrap();
-            map.fold(
-                vec![Crease::simple(
-                    buffer_snapshot.offset_to_point(MultiBufferOffset(fold_row_start + 10))
-                        ..buffer_snapshot.offset_to_point(MultiBufferOffset(fold_row_start + 20)),
-                    FoldPlaceholder::test(),
-                )],
-                cx,
-            );
-            let repl_row_start = text.find("rrr").unwrap();
-            map.splice_inlays(
-                &[],
-                vec![
-                    Inlay::mock_hint(
-                        0,
-                        buffer_snapshot.anchor_after(MultiBufferOffset(5)),
-                        "hint",
-                    ),
-                    Inlay::repl_result(
-                        1,
-                        buffer_snapshot.anchor_after(MultiBufferOffset(repl_row_start + 5)),
-                        "result",
-                    ),
-                ],
-                cx,
-            );
-        });
-        let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
-
-        assert!(snapshot.is_windowed_row(DisplayRow(0), monospace));
-        assert!(!snapshot.is_windowed_row(DisplayRow(0), proportional));
-        assert!(snapshot.is_windowed_row(DisplayRow(1), monospace));
-        assert!(!snapshot.is_windowed_row(DisplayRow(2), monospace));
-        assert!(!snapshot.is_windowed_row(DisplayRow(3), monospace));
-        assert!(!snapshot.is_windowed_row(DisplayRow(4), monospace));
-        assert!(!snapshot.is_windowed_row(DisplayRow(5), monospace));
-
-        let mut masked = snapshot.clone();
-        masked.masked = true;
-        assert!(!masked.is_long_unwrapped_row(DisplayRow(0)));
-        assert!(!masked.is_long_unwrapped_row(DisplayRow(2)));
-        assert!(!snapshot.is_windowed_row(DisplayRow(6), monospace));
-    }
-
-    #[gpui::test]
-    async fn test_ruler_uses_measured_inlay_renderer_widths(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| init_test(cx, &|_| {}));
-
-        let mut cx = crate::test::editor_test_context::EditorTestContext::new(cx).await;
-        cx.set_state(&format!("ˇ{}", "漢".repeat(MAX_LINE_LEN)));
-        let inlay_id = InlayId::ReplResult(7);
-        cx.update_editor(|editor, _, cx| {
-            let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
-            editor.display_map.update(cx, |map, cx| {
-                map.splice_inlays(
-                    &[],
-                    vec![Inlay::repl_result(
-                        7,
-                        buffer_snapshot.anchor_after(MultiBufferOffset(3)),
-                        "x",
-                    )],
-                    cx,
-                );
-            });
-        });
-        let ruler_width = |cx: &mut crate::test::editor_test_context::EditorTestContext| {
-            cx.update_editor(|editor, window, cx| {
-                let snapshot = editor.snapshot(window, cx).display_snapshot;
-                let details = editor.text_layout_details(window, cx);
-                let cell = details.grid_cell();
-                assert!(!snapshot.is_windowed_row(DisplayRow(0), cell));
-                let layout = snapshot.layout_row(DisplayRow(0), &details);
-                (layout.width(), ScrollPixelOffset::from(cell.width))
-            })
-        };
-
-        let (guessed_width, cell_width) = ruler_width(&mut cx);
-        let changed = cx.update_editor(|editor, _, cx| {
-            editor.display_map.update(cx, |map, cx| {
-                map.update_fold_widths([(ChunkRendererId::Inlay(inlay_id), px(200.))], cx)
-            })
-        });
-        assert!(changed);
-        let (measured_width, _) = ruler_width(&mut cx);
-        assert!(((measured_width - guessed_width) - (200. - cell_width)).abs() < 0.01);
-
-        let changed = cx.update_editor(|editor, _, cx| {
-            editor.display_map.update(cx, |map, cx| {
-                map.update_fold_widths([(ChunkRendererId::Inlay(inlay_id), px(200.))], cx)
-            })
-        });
-        assert!(!changed);
-    }
-
-    #[gpui::test]
-    async fn test_windowed_rows_inside_multiline_inlays(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| init_test(cx, &|_| {}));
-
-        let mut cx = crate::test::editor_test_context::EditorTestContext::new(cx).await;
-        cx.set_state("aˇb");
-        let inlay_text = format!("p\n{}\nr", "q".repeat(2_048));
-        cx.update_editor(|editor, _, cx| {
-            let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
-            editor.display_map.update(cx, |map, cx| {
-                map.splice_inlays(
-                    &[],
-                    vec![Inlay::mock_hint(
-                        0,
-                        buffer_snapshot.anchor_after(MultiBufferOffset(1)),
-                        inlay_text.as_str(),
-                    )],
-                    cx,
-                );
-            });
-        });
-        let (snapshot, details) = cx.update_editor(|editor, window, cx| {
-            editor.set_visible_column_count(100.);
-            editor.set_scroll_position(gpui::point(200., 0.), window, cx);
-            (
-                editor.snapshot(window, cx).display_snapshot,
-                editor.text_layout_details(window, cx),
-            )
-        });
-        assert_eq!(snapshot.text(), format!("ap\n{}\nrb", "q".repeat(2_048)));
-        let cell = details.grid_cell();
-        assert!(cell.monospace);
-        assert!(!snapshot.is_windowed_row(DisplayRow(0), cell));
-        assert!(snapshot.is_windowed_row(DisplayRow(1), cell));
-        assert!(!snapshot.is_windowed_row(DisplayRow(2), cell));
-
-        let cell_width = ScrollPixelOffset::from(cell.width);
-        let layout = snapshot.layout_row(DisplayRow(1), &details);
-        assert!(matches!(layout, RowLayout::Windowed { .. }));
-        assert_eq!(layout.x_for_index(50), cell_width * 50.);
-        assert!((layout.x_for_index(250) - cell_width * 250.).abs() < 0.01);
-        assert_eq!(layout.closest_index_for_x(cell_width * 250.), 250);
-        assert_eq!(layout.closest_index_for_x(cell_width * 2_000.), 2_000);
-        assert_eq!(layout.width(), cell_width * 2_048.);
-
-        let style = EditorStyle::default();
-        let language_aware = LanguageAwareStyling {
-            tree_sitter: false,
-            diagnostics: false,
-        };
-        let chunks_text = snapshot
-            .highlighted_chunks_in_range(
-                DisplayPoint::new(DisplayRow(1), 100)..DisplayPoint::new(DisplayRow(1), 350),
-                language_aware,
-                &style,
-            )
-            .map(|chunk| chunk.text)
-            .collect::<String>();
-        assert_eq!(chunks_text, "q".repeat(250));
-    }
-
-    #[gpui::test]
-    async fn test_shaping_window_selection(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| init_test(cx, &|_| {}));
-
-        let cell = GridCell {
-            width: px(10.),
-            monospace: true,
-        };
-        let viewport = |scroll_columns: f64| HorizontalViewport {
-            scroll_columns,
-            visible_columns: 100.,
-            text_align: TextAlign::Left,
-            content_width: px(600.),
-        };
-
-        let centered = HorizontalViewport {
-            text_align: TextAlign::Center,
-            ..viewport(0.)
-        };
-        assert_eq!(centered.aligned(40_000., cell).scroll_columns, 1_970.);
-        assert_eq!(
-            centered.aligned(40_000., cell).shaping_window(4_000),
-            1_900..2_150
-        );
-        let right_aligned = HorizontalViewport {
-            text_align: TextAlign::Right,
-            ..viewport(0.)
-        };
-        assert_eq!(right_aligned.aligned(40_000., cell).scroll_columns, 3_940.);
-        assert_eq!(viewport(0.).aligned(40_000., cell), viewport(0.));
-
-        assert_eq!(viewport(0.).shaping_window(10_000), 0..250);
-        assert_eq!(viewport(120.).shaping_window(10_000), 0..250);
-        assert_eq!(viewport(170.).shaping_window(10_000), 100..350);
-        assert_eq!(viewport(9_950.).shaping_window(10_000), 9_750..10_000);
-        assert_eq!(viewport(20_000.).shaping_window(10_000), 9_750..10_000);
-        assert_eq!(viewport(170.).shaping_window(300), 50..300);
-
-        let window = viewport(170.).shaping_window(10_000);
-        assert!(cell.fits(&window, px(2_500.)));
-        assert!(cell.fits(&window, px(2_500.4)));
-        assert!(!cell.fits(&window, px(2_501.)));
-        assert!(!cell.fits(&window, px(2_490.)));
-    }
-
-    #[gpui::test]
-    async fn test_windowed_row_layout_positions(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| init_test(cx, &|_| {}));
-
-        let cell = GridCell {
-            width: px(10.),
-            monospace: true,
-        };
-        let geometry = WindowedRowGeometry::new(10_000, cell, 2_000..2_300);
-        let glyphs = (0..300)
-            .map(|glyph_index| gpui::ShapedGlyph {
-                id: gpui::GlyphId(1),
-                position: gpui::point(px(10. * glyph_index as f32), px(0.)),
-                index: glyph_index,
-                is_emoji: false,
-            })
-            .collect::<Vec<_>>();
-        let shaped = Arc::new(LineLayout {
-            width: px(3_000.),
-            len: 300,
-            runs: vec![gpui::ShapedRun {
-                font_id: gpui::FontId(0),
-                glyphs,
-            }],
-            ..LineLayout::default()
-        });
-        let layout = RowLayout::Windowed { geometry, shaped };
-
-        assert_eq!(layout.x_for_index(0), 0.);
-        assert_eq!(layout.x_for_index(1_000), 10_000.);
-        assert_eq!(layout.x_for_index(2_000), 20_000.);
-        assert_eq!(layout.x_for_index(2_150), 21_500.);
-        assert_eq!(layout.x_for_index(2_300), 23_000.);
-        assert_eq!(layout.x_for_index(8_000), 80_000.);
-        assert_eq!(layout.x_for_index(10_000), 100_000.);
-        assert_eq!(layout.width(), 100_000.);
-
-        assert_eq!(layout.closest_index_for_x(-5.), 0);
-        assert_eq!(layout.closest_index_for_x(10_004.), 1_000);
-        assert_eq!(layout.closest_index_for_x(10_006.), 1_001);
-        assert_eq!(layout.closest_index_for_x(20_000.), 2_000);
-        assert_eq!(layout.closest_index_for_x(21_504.), 2_150);
-        assert_eq!(layout.closest_index_for_x(43_000.), 4_300);
-        assert_eq!(layout.closest_index_for_x(1_000_000.), 10_000);
-    }
-
-    #[gpui::test]
-    async fn test_vertical_movement_on_long_rows_is_scroll_invariant(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(|cx| init_test(cx, &|_| {}));
-
-        let mut cx = crate::test::editor_test_context::EditorTestContext::new(cx).await;
-        let ascii_len = MAX_LINE_LEN * 3;
-        let wide_len = MAX_LINE_LEN * 2;
-        cx.set_state(&format!(
-            "ˇ{}\nx\n{}\nx",
-            "a".repeat(ascii_len),
-            "🙂".repeat(wide_len)
-        ));
-
-        for (row, column) in [
-            (0, ascii_len as u32 - 100),
-            (0, 1_500),
-            (2, ('🙂'.len_utf8() * (wide_len - 100)) as u32),
-            (2, '🙂'.len_utf8() as u32 * 700),
-        ] {
-            let start = DisplayPoint::new(DisplayRow(row), column);
-            let (below, goal) = cx.update_editor(|editor, window, cx| {
-                editor.set_visible_column_count(100.);
-                editor.set_scroll_position(gpui::point(column as f64 - 40., 0.), window, cx);
-                let snapshot = editor.snapshot(window, cx);
-                let details = editor.text_layout_details(window, cx);
-                movement::down(
-                    &snapshot,
-                    start,
-                    language::SelectionGoal::None,
-                    false,
-                    &details,
-                )
-            });
-            assert_eq!(below, DisplayPoint::new(DisplayRow(row + 1), 1));
-
-            for scroll_columns in [0., 20., 700., 3_000., 5_000.] {
-                let (back, _) = cx.update_editor(|editor, window, cx| {
-                    editor.set_scroll_position(gpui::point(scroll_columns, 0.), window, cx);
-                    let snapshot = editor.snapshot(window, cx);
-                    let details = editor.text_layout_details(window, cx);
-                    movement::up(&snapshot, below, goal, false, &details)
-                });
-                assert_eq!(
-                    back, start,
-                    "moving up from {below:?} with the viewport at column {scroll_columns}"
-                );
-            }
-        }
-    }
-
-    fn build_snapshot(text: &str, cx: &mut gpui::TestAppContext) -> DisplaySnapshot {
-        let buffer = cx.update(|cx| MultiBuffer::build_simple(text, cx));
-        let map = cx.new(|cx| {
-            DisplayMap::new(
-                buffer,
-                test_font(),
-                px(14.),
-                None,
-                1,
-                1,
-                FoldPlaceholder::test(),
-                DiagnosticSeverity::Warning,
-                cx,
-            )
-        });
-        map.update(cx, |map, cx| map.snapshot(cx))
-    }
-
-    #[gpui::test]
-    async fn test_masked_text_chunks_preserve_newlines(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| init_test(cx, &|_| {}));
-
-        let buffer = cx.new(|cx| Buffer::local("secret\nwörds\nhere", cx));
-        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-        let map = cx.new(|cx| {
-            DisplayMap::new(
-                buffer,
-                font("Helvetica"),
-                px(14.0),
-                None,
-                1,
-                1,
-                FoldPlaceholder::test(),
-                DiagnosticSeverity::Warning,
-                cx,
-            )
-        });
-        let snapshot = cx.update(|cx| {
-            map.update(cx, |map, cx| {
-                map.masked = true;
-                map.snapshot(cx)
-            })
-        });
-
-        assert_eq!(
-            snapshot.text_chunks(DisplayRow(0)).collect::<String>(),
-            "******\n*****\n****"
-        );
-        assert_eq!(
-            snapshot
-                .reverse_text_chunks(DisplayRow(2))
-                .collect::<String>(),
-            "****\n*****\n******"
-        );
-        assert_eq!(
-            snapshot
-                .chunks(
-                    DisplayRow(0)..DisplayRow(3),
-                    LanguageAwareStyling {
-                        tree_sitter: false,
-                        diagnostics: false,
-                    },
-                    HighlightStyles::default(),
-                )
-                .map(|chunk| chunk.text)
-                .collect::<String>(),
-            "******\n*****\n****"
-        );
-    }
-
-    #[test]
-    fn test_mask_chunks_splits_chunks_longer_than_bullets() {
-        let first_len = BULLETS.len() + 22;
-        let second_len = BULLETS.len() * 2 + 44;
-        let text = format!("{}\n{}", "α".repeat(first_len), "x".repeat(second_len));
-        let chunk = Chunk {
-            text: &text,
-            ..Chunk::default()
-        };
-
-        let masked = mask_chunks(std::iter::once(chunk)).collect::<Vec<_>>();
-
-        for chunk in &masked {
-            assert!(chunk.text.len() <= BULLETS.len());
-            assert_eq!(
-                chunk.chars,
-                1u128.unbounded_shl(chunk.text.len() as u32).wrapping_sub(1)
-            );
-        }
-        assert_eq!(
-            masked.iter().map(|chunk| chunk.text).collect::<String>(),
-            format!("{}\n{}", "*".repeat(first_len), "*".repeat(second_len))
-        );
-    }
-
-    #[gpui::test]
-    async fn test_columnar_selection_on_huge_unwrapped_line_uses_monospace_grid(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(|cx| init_test(cx, &|_| {}));
-
-        let mut cx = crate::test::editor_test_context::EditorTestContext::new(cx).await;
-        let long_len = MAX_LINE_LEN * 2;
-        cx.set_state(&format!(
-            "ˇ{}\n{}",
-            "x".repeat(long_len),
-            "α".repeat(long_len)
-        ));
-
-        cx.update_editor(|editor, window, cx| {
-            let text_layout_details = editor.text_layout_details(window, cx);
-            let snapshot = editor.snapshot(window, cx);
-            let cell_width = snapshot
-                .x_for_display_point(DisplayPoint::new(DisplayRow(0), 1), &text_layout_details);
-            assert!(cell_width > 0.);
-
-            let positions = cell_width * 100.0..cell_width * 200.0;
-            let selection = editor
-                .selections
-                .build_columnar_selection(
-                    &snapshot,
-                    DisplayRow(0),
-                    &positions,
-                    false,
-                    &text_layout_details,
-                )
-                .unwrap();
-            assert_eq!(selection.start, Point::new(0, 100));
-            assert_eq!(selection.end, Point::new(0, 200));
-
-            let positions = cell_width * 101.0..cell_width * 200.0;
-            let selection = editor
-                .selections
-                .build_columnar_selection(
-                    &snapshot,
-                    DisplayRow(1),
-                    &positions,
-                    false,
-                    &text_layout_details,
-                )
-                .unwrap();
-            assert_eq!(selection.start, Point::new(1, 101 * 'α'.len_utf8() as u32));
-            assert_eq!(selection.end, Point::new(1, 200 * 'α'.len_utf8() as u32));
-        });
-    }
-
-    #[gpui::test]
-    async fn test_navigation_on_huge_unwrapped_lines_uses_monospace_grid(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(|cx| init_test(cx, &|_| {}));
-
-        let mut cx = crate::test::editor_test_context::EditorTestContext::new(cx).await;
-        let long_len = MAX_LINE_LEN * 2;
-        cx.set_state(&format!(
-            "ˇ{}\n{}\nshort",
-            "x".repeat(long_len),
-            "α".repeat(long_len)
-        ));
-
-        cx.update_editor(|editor, window, cx| {
-            let text_layout_details = editor.text_layout_details(window, cx);
-            let snapshot = editor.snapshot(window, cx);
-
-            let column = (long_len - 10) as u32;
-            let x = snapshot.x_for_display_point(
-                DisplayPoint::new(DisplayRow(0), column),
-                &text_layout_details,
-            );
-            assert!(x > 0.);
-            assert_eq!(
-                snapshot.display_column_for_x(DisplayRow(0), x, &text_layout_details),
-                column
-            );
-
-            let odd_x = snapshot.x_for_display_point(
-                DisplayPoint::new(DisplayRow(0), (long_len - 9) as u32),
-                &text_layout_details,
-            );
-            assert_eq!(
-                snapshot.display_column_for_x(DisplayRow(1), odd_x, &text_layout_details),
-                ((long_len - 9) * 'α'.len_utf8()) as u32
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_layout_row_shapes_long_rows_when_soft_wrapped(cx: &mut gpui::TestAppContext) {
-        cx.background_executor
-            .set_block_on_ticks(usize::MAX..=usize::MAX);
-        cx.update(|cx| init_test(cx, &|_| {}));
-
-        let mut cx = crate::test::editor_test_context::EditorTestContext::new(cx).await;
-        let editor = cx.editor.clone();
-        let window = cx.window;
-
-        cx.update_window(window, |_, window, cx| {
-            let text_layout_details =
-                editor.update(cx, |editor, cx| editor.text_layout_details(window, cx));
-
-            let buffer = MultiBuffer::build_simple(&"x".repeat(MAX_LINE_LEN * 3), cx);
-            let map = cx.new(|cx| {
-                DisplayMap::new(
-                    buffer,
-                    font("Helvetica"),
-                    px(14.0),
-                    Some(px(12_000.0)),
-                    1,
-                    1,
-                    FoldPlaceholder::test(),
-                    DiagnosticSeverity::Warning,
-                    cx,
-                )
-            });
-            let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
-            assert!(snapshot.has_soft_wraps());
-            assert!(snapshot.line_len(DisplayRow(0)) as usize > MAX_LINE_LEN);
-
-            assert!(matches!(
-                snapshot.layout_row(DisplayRow(0), &text_layout_details),
-                RowLayout::Shaped(_)
-            ));
-        })
-        .unwrap();
-    }
-
-    #[gpui::test]
-    async fn test_masked_soft_wrapped_line_with_deep_indent(cx: &mut gpui::TestAppContext) {
-        cx.background_executor
-            .set_block_on_ticks(usize::MAX..=usize::MAX);
-        cx.update(|cx| init_test(cx, &|_| {}));
-
-        let text = format!("{}{}", " ".repeat(200), "x".repeat(2000));
-        let buffer = cx.new(|cx| Buffer::local(text, cx));
-        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-        let map = cx.new(|cx| {
-            DisplayMap::new(
-                buffer,
-                font("Helvetica"),
-                px(14.0),
-                Some(px(3000.0)),
-                1,
-                1,
-                FoldPlaceholder::test(),
-                DiagnosticSeverity::Warning,
-                cx,
-            )
-        });
-        let snapshot = cx.update(|cx| {
-            map.update(cx, |map, cx| {
-                map.masked = true;
-                map.snapshot(cx)
-            })
-        });
-        assert!(snapshot.max_point().row().0 > 0);
-
-        let masked_text = snapshot.text_chunks(DisplayRow(0)).collect::<String>();
-        let unmasked_line_count = snapshot.max_point().row().0 as usize + 1;
-        assert_eq!(masked_text.split('\n').count(), unmasked_line_count);
-    }
-
-    #[gpui::test]
     async fn test_chunks_with_syntax_highlighting_across_blocks(cx: &mut gpui::TestAppContext) {
         cx.background_executor
             .set_block_on_ticks(usize::MAX..=usize::MAX);
@@ -5092,6 +5045,439 @@ pub mod tests {
                 ("\n".into(), None),
             ]
         );
+    }
+
+    #[gpui::test]
+    async fn test_masked_chunks(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| init_test(cx, &|_| {}));
+        let language_aware = LanguageAwareStyling {
+            tree_sitter: false,
+            diagnostics: false,
+        };
+        let long_len = MAX_LINE_LEN * 2;
+        let multibyte_len = BULLETS.len() + 22;
+        let text = format!(
+            "{}\nwörds\n{}",
+            "α".repeat(multibyte_len),
+            "x".repeat(long_len)
+        );
+        let snapshot = build_snapshot(&text, None, true, cx);
+        assert_eq!(
+            snapshot.text_chunks(DisplayRow(0)).collect::<String>(),
+            format!(
+                "{}\n*****\n{}",
+                "*".repeat(multibyte_len),
+                "*".repeat(long_len)
+            )
+        );
+        for chunk in snapshot.chunks(
+            DisplayRow(0)..DisplayRow(3),
+            language_aware,
+            HighlightStyles::default(),
+        ) {
+            assert!(chunk.text.len() <= BULLETS.len());
+            assert_eq!(
+                chunk.chars,
+                1u128.unbounded_shl(chunk.text.len() as u32).wrapping_sub(1)
+            );
+        }
+        let style = EditorStyle::default();
+        let chunks_text = |start: (u32, u32), end: (u32, u32)| {
+            snapshot
+                .highlighted_chunks_in_range(
+                    DisplayPoint::new(DisplayRow(start.0), start.1)
+                        ..DisplayPoint::new(DisplayRow(end.0), end.1),
+                    language_aware,
+                    &style,
+                )
+                .map(|chunk| chunk.text)
+                .collect::<String>()
+        };
+        assert_eq!(chunks_text((2, 1_000), (2, 1_010)), "*".repeat(10));
+        assert_eq!(chunks_text((1, 3), (2, 3)), "***\n***");
+    }
+
+    #[gpui::test]
+    async fn test_highlighted_chunks_in_range_keeps_exact_endpoints(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            init_test(cx, &|settings| {
+                settings.project.all_languages.defaults.tab_size = NonZeroU32::new(128);
+            })
+        });
+        let style = EditorStyle::default();
+        let language_aware = LanguageAwareStyling {
+            tree_sitter: false,
+            diagnostics: false,
+        };
+
+        let text = format!("{}\t{}", "x".repeat(79), "y".repeat(3_000));
+        let snapshot = build_snapshot(&text, None, false, cx);
+        assert_eq!(snapshot.line_len(DisplayRow(0)), 79 + 49 + 3_000);
+        let chunks_text = |snapshot: &DisplaySnapshot, columns: Range<u32>| {
+            snapshot
+                .highlighted_chunks_in_range(
+                    DisplayPoint::new(DisplayRow(0), columns.start)
+                        ..DisplayPoint::new(DisplayRow(0), columns.end),
+                    language_aware,
+                    &style,
+                )
+                .map(|chunk| chunk.text)
+                .collect::<String>()
+        };
+        assert_eq!(
+            chunks_text(&snapshot, 100..350),
+            format!("{}{}", " ".repeat(28), "y".repeat(222))
+        );
+        assert_eq!(
+            chunks_text(&snapshot, 50..100),
+            format!("{}{}", "x".repeat(29), " ".repeat(21))
+        );
+        assert_eq!(chunks_text(&snapshot, 90..110), " ".repeat(20));
+
+        let text = format!("{}Z", "x".repeat(2_047));
+        let mut snapshot = build_snapshot(&text, None, false, cx);
+        snapshot.clip_at_line_ends = true;
+        assert_eq!(
+            chunks_text(&snapshot, 1_798..2_048),
+            format!("{}Z", "x".repeat(249))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_is_windowed_row_requires_exact_grid(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| init_test(cx, &|_| {}));
+        let monospace = GridCell {
+            width: px(10.),
+            monospace: true,
+        };
+        let proportional = GridCell {
+            width: px(10.),
+            monospace: false,
+        };
+
+        let long_len = MAX_LINE_LEN * 2;
+        let text = format!(
+            "{}\n{}\t{}\n{}\nshort\n{}\n{}\n{}\n{}\u{1}{}\nab",
+            "x".repeat(long_len),
+            "x".repeat(30),
+            "y".repeat(long_len),
+            "é".repeat(long_len),
+            "f".repeat(long_len),
+            "r".repeat(long_len),
+            "c".repeat(long_len),
+            "x".repeat(1_000),
+            "x".repeat(3_000),
+        );
+        let buffer = cx.update(|cx| MultiBuffer::build_simple(&text, cx));
+        let buffer_snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
+        let anchor_after = |needle: &str, delta: usize| {
+            buffer_snapshot.anchor_after(MultiBufferOffset(text.find(needle).unwrap() + delta))
+        };
+        let map = cx.update(|cx| inlay_test_map(buffer.clone(), test_font(), px(14.), None, cx));
+        let inlay_text = format!("p\n{}\nr", "q".repeat(long_len));
+        map.update(cx, |map, cx| {
+            let fold_start = text.find("fff").unwrap();
+            map.fold(
+                vec![Crease::simple(
+                    buffer_snapshot.offset_to_point(MultiBufferOffset(fold_start + 10))
+                        ..buffer_snapshot.offset_to_point(MultiBufferOffset(fold_start + 20)),
+                    FoldPlaceholder::test(),
+                )],
+                cx,
+            );
+            map.splice_inlays(
+                &[],
+                vec![
+                    Inlay::mock_hint(0, anchor_after("x", 5), "hint"),
+                    Inlay::repl_result(1, anchor_after("rrr", 5), "result"),
+                    Inlay::mock_hint(2, anchor_after("ccc", 5), "\u{2}"),
+                    Inlay::mock_hint(3, anchor_after("\nab", 2), inlay_text.as_str()),
+                ],
+                cx,
+            );
+        });
+        let windowed = |snapshot: &DisplaySnapshot| {
+            (0..=10)
+                .map(|row| snapshot.is_windowed_row(DisplayRow(row), monospace))
+                .collect::<Vec<_>>()
+        };
+        let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
+        let mut expected = [
+            true, true, false, false, false, false, false, false, false, true, false,
+        ];
+        assert_eq!(windowed(&snapshot), expected);
+        assert!(!snapshot.is_windowed_row(DisplayRow(0), proportional));
+        assert!(snapshot.is_long_unwrapped_row(DisplayRow(7)));
+        let mut masked = snapshot;
+        masked.masked = true;
+        assert!(!masked.is_long_unwrapped_row(DisplayRow(0)));
+
+        let mut edit = |range: Range<Point>, new_text: &str| {
+            buffer.update(cx, |buffer, cx| buffer.edit([(range, new_text)], None, cx));
+            windowed(&map.update(cx, |map, cx| map.snapshot(cx)))
+        };
+        assert_eq!(edit(Point::new(3, 0)..Point::new(3, 0), "\u{7f}"), expected);
+        assert_eq!(edit(Point::new(0, 5)..Point::new(0, 5), "ab"), expected);
+        expected[0] = false;
+        assert_eq!(edit(Point::new(0, 5)..Point::new(0, 5), "\u{7f}"), expected);
+        expected[0] = true;
+        assert_eq!(edit(Point::new(0, 5)..Point::new(0, 6), ""), expected);
+        expected[7] = true;
+        assert_eq!(
+            edit(Point::new(7, 1_000)..Point::new(7, 1_001), ""),
+            expected
+        );
+    }
+
+    #[gpui::test]
+    async fn test_grapheme_at_returns_whole_graphemes(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| init_test(cx, &|_| {}));
+
+        let long_cluster = format!("a{}", "\u{301}".repeat(64));
+        let text = format!(
+            "{long_cluster}{}\ne\u{301}🇺🇸🇺🇸x \u{1}",
+            "漢".repeat(MAX_LINE_LEN * 2)
+        );
+        let snapshot = build_snapshot(&text, None, false, cx);
+        let grapheme_at = |row: u32, column: usize| {
+            snapshot.grapheme_at(DisplayPoint::new(DisplayRow(row), column as u32))
+        };
+
+        assert_eq!(grapheme_at(0, 0), Some(long_cluster.as_str().into()));
+        assert_eq!(grapheme_at(0, long_cluster.len()), Some("漢".into()));
+        assert_eq!(
+            grapheme_at(0, long_cluster.len() + 3 * 1_000),
+            Some("漢".into())
+        );
+        assert_eq!(grapheme_at(0, text.find('\n').unwrap()), Some(" ".into()));
+        assert_eq!(grapheme_at(1, 0), Some("e\u{301}".into()));
+        assert_eq!(grapheme_at(1, 3), Some("🇺🇸".into()));
+        assert_eq!(grapheme_at(1, 11), Some("🇺🇸".into()));
+        assert_eq!(grapheme_at(1, 19), Some("x".into()));
+        assert_eq!(grapheme_at(1, 20), Some(" ".into()));
+        assert_eq!(grapheme_at(1, 21), Some("␁".into()));
+        assert_eq!(grapheme_at(1, 22), None);
+    }
+
+    #[gpui::test]
+    async fn test_ruler_uses_measured_inlay_renderer_widths(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| init_test(cx, &|_| {}));
+
+        let mut cx = crate::test::editor_test_context::EditorTestContext::new(cx).await;
+        cx.set_state(&format!("ˇ{}", "漢".repeat(MAX_LINE_LEN)));
+        let (guessed_width, cell_width, shaper) = cx.update_editor(|editor, window, cx| {
+            let position = editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .anchor_after(MultiBufferOffset(3));
+            let inlay = Inlay::repl_result(7, position, "x");
+            editor
+                .display_map
+                .update(cx, |map, cx| map.splice_inlays(&[], vec![inlay], cx));
+            let snapshot = editor.snapshot(window, cx).display_snapshot;
+            let details = editor.text_layout_details(window, cx);
+            let cell = details.grid_cell();
+            assert!(!snapshot.is_windowed_row(DisplayRow(0), cell));
+            (
+                snapshot.layout_row(DisplayRow(0), &details).width(),
+                ScrollPixelOffset::from(cell.width),
+                details.ruler_shaper(&snapshot, DisplayRow(0)),
+            )
+        });
+        let key = renderer_metrics_key(&shaper.style.text.font(), shaper.font_size);
+        let zoomed_key = renderer_metrics_key(&shaper.style.text.font(), shaper.font_size * 2.);
+        let mut update_widths = |width: Pixels, key: u64| {
+            cx.update_editor(|editor, window, cx| {
+                let widths = [(ChunkRendererId::Inlay(InlayId::ReplResult(7)), width)];
+                let changed = editor
+                    .display_map
+                    .update(cx, |map, cx| map.update_fold_widths(widths, key, cx));
+                let snapshot = editor.snapshot(window, cx).display_snapshot;
+                let details = editor.text_layout_details(window, cx);
+                (
+                    changed,
+                    snapshot.layout_row(DisplayRow(0), &details).width(),
+                )
+            })
+        };
+
+        let (changed, measured_width) = update_widths(px(200.), key);
+        assert!(changed);
+        assert!(((measured_width - guessed_width) - (200. - cell_width)).abs() < 0.01);
+        assert!(!update_widths(px(200.), key).0);
+        let (changed, stale_width) = update_widths(px(400.), zoomed_key);
+        assert!(changed);
+        assert!((stale_width - guessed_width).abs() < 0.01);
+        let (changed, remeasured_width) = update_widths(px(200.), key);
+        assert!(changed);
+        assert!((remeasured_width - measured_width).abs() < 0.01);
+    }
+
+    #[gpui::test]
+    async fn test_rulers_of_inlay_rows_are_never_retained_for_each_other(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| init_test(cx, &|_| {}));
+
+        let mut cx = crate::test::editor_test_context::EditorTestContext::new(cx).await;
+        cx.set_state("ˇ\ncd");
+        let inlay_text = format!("p\n{}\n{}\nr", "漢".repeat(2_000), "🙂".repeat(2_000));
+        cx.update_editor(|editor, _, cx| {
+            let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+            editor.display_map.update(cx, |map, cx| {
+                map.splice_inlays(
+                    &[],
+                    vec![Inlay::mock_hint(
+                        0,
+                        buffer_snapshot.anchor_after(MultiBufferOffset(0)),
+                        inlay_text.as_str(),
+                    )],
+                    cx,
+                );
+            });
+        });
+        let rulers_for = |cx: &mut crate::test::editor_test_context::EditorTestContext| {
+            cx.update_editor(|editor, window, cx| {
+                let snapshot = editor.snapshot(window, cx).display_snapshot;
+                let details = editor.text_layout_details(window, cx);
+                [DisplayRow(1), DisplayRow(2)].map(|row| {
+                    snapshot
+                        .ruled_row(row, details.ruler_shaper(&snapshot, row))
+                        .ruler
+                })
+            })
+        };
+        let [first, second] = rulers_for(&mut cx);
+        assert_eq!((first.len(), second.len()), (6_000, 8_000));
+
+        cx.update_editor(|editor, _, cx| {
+            editor.edit([(Point::new(1, 0)..Point::new(1, 0), "x")], cx);
+        });
+        let [first_again, second_again] = rulers_for(&mut cx);
+        assert_eq!((first_again.len(), second_again.len()), (6_000, 8_000));
+        assert!(!Arc::ptr_eq(&first, &first_again));
+        assert!(!Arc::ptr_eq(&second, &second_again));
+    }
+
+    #[test]
+    fn test_shaping_window_selection() {
+        let cell = GridCell {
+            width: px(10.),
+            monospace: true,
+        };
+        let viewport = |scroll_columns: f64, text_align: TextAlign| HorizontalViewport {
+            scroll_columns,
+            visible_columns: 100.,
+            text_align,
+            content_width: px(600.),
+        };
+        let centered = viewport(0., TextAlign::Center).aligned(40_000., cell);
+        assert_eq!(centered.scroll_columns, 1_970.);
+        assert_eq!(centered.shaping_window(4_000), 1_900..2_150);
+        let right_aligned = viewport(0., TextAlign::Right).aligned(40_000., cell);
+        assert_eq!(right_aligned.scroll_columns, 3_940.);
+        for (scroll_columns, row_len, window) in [
+            (0., 10_000, 0..250),
+            (120., 10_000, 0..250),
+            (170., 10_000, 100..350),
+            (9_950., 10_000, 9_750..10_000),
+            (20_000., 10_000, 9_750..10_000),
+            (170., 300, 50..300),
+        ] {
+            let viewport = viewport(scroll_columns, TextAlign::Left);
+            assert_eq!(viewport.aligned(40_000., cell), viewport);
+            assert_eq!(viewport.shaping_window(row_len), window);
+        }
+        assert!(cell.fits(&(100..350), px(2_500.4)));
+        assert!(!cell.fits(&(100..350), px(2_501.)));
+    }
+
+    #[gpui::test]
+    async fn test_layout_row_shapes_long_rows_when_soft_wrapped(cx: &mut gpui::TestAppContext) {
+        cx.background_executor
+            .set_block_on_ticks(usize::MAX..=usize::MAX);
+        cx.update(|cx| init_test(cx, &|_| {}));
+        let snapshot = build_snapshot(&"x".repeat(MAX_LINE_LEN * 3), Some(px(12_000.)), false, cx);
+        assert!(snapshot.has_soft_wraps());
+        assert!(snapshot.line_len(DisplayRow(0)) as usize > MAX_LINE_LEN);
+        let mut cx = crate::test::editor_test_context::EditorTestContext::new(cx).await;
+        let details = cx.update_editor(|editor, window, cx| editor.text_layout_details(window, cx));
+        assert!(matches!(
+            snapshot.layout_row(DisplayRow(0), &details),
+            RowLayout::Shaped(_)
+        ));
+    }
+
+    #[gpui::test]
+    async fn test_windowed_chunks_inherit_inlay_diagnostics(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| init_test(cx, &|_| {}));
+        let buffer = cx.new(|cx| Buffer::local("aXYZz", cx));
+        buffer.update(cx, |buffer, cx| {
+            let entry = DiagnosticEntry::new(
+                PointUtf16::new(0, 1)..PointUtf16::new(0, 4),
+                Diagnostic {
+                    severity: lsp::DiagnosticSeverity::ERROR,
+                    group_id: 1,
+                    message: "hi".into(),
+                    ..Default::default()
+                },
+            );
+            let diagnostics = DiagnosticSet::new([entry], buffer);
+            buffer.update_diagnostics(LanguageServerId(0), diagnostics, cx)
+        });
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer_snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
+        let map = cx.update(|cx| inlay_test_map(buffer, font("Courier"), px(16.0), None, cx));
+        let hint = "h".repeat(4_096);
+        map.update(cx, |map, cx| {
+            let position = buffer_snapshot.anchor_after(MultiBufferOffset(4));
+            map.splice_inlays(&[], vec![Inlay::mock_hint(0, position, hint.as_str())], cx);
+        });
+        let style = EditorStyle::default();
+        let underlined =
+            |map: &Entity<DisplayMap>, columns: Range<u32>, cx: &mut gpui::TestAppContext| {
+                let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
+                snapshot
+                    .highlighted_chunks_in_range(
+                        DisplayPoint::new(DisplayRow(0), columns.start)
+                            ..DisplayPoint::new(DisplayRow(0), columns.end),
+                        LanguageAwareStyling {
+                            tree_sitter: false,
+                            diagnostics: true,
+                        },
+                        &style,
+                    )
+                    .filter(|chunk| chunk.diagnostic_underline_severity.is_some())
+                    .map(|chunk| chunk.text.len())
+                    .sum::<usize>()
+            };
+
+        assert_eq!(underlined(&map, 0..4_101, cx), 3 + 4_096);
+        assert_eq!(underlined(&map, 100..350, cx), 250);
+        assert_eq!(underlined(&map, 4_100..4_101, cx), 0);
+
+        let with_diagnostics = map.update(cx, |map, cx| map.snapshot(cx)).row_rulers;
+        map.update(cx, |map, _| {
+            map.diagnostics_max_severity = DiagnosticSeverity::Off
+        });
+        assert_eq!(underlined(&map, 100..350, cx), 0);
+        let without_diagnostics = map.update(cx, |map, cx| map.snapshot(cx)).row_rulers;
+        assert!(!Arc::ptr_eq(&with_diagnostics, &without_diagnostics));
+
+        map.update(cx, |map, cx| {
+            map.diagnostics_max_severity = DiagnosticSeverity::Warning;
+            map.fold(
+                vec![Crease::simple(
+                    MultiBufferPoint::new(0, 1)..MultiBufferPoint::new(0, 4),
+                    FoldPlaceholder::test(),
+                )],
+                cx,
+            )
+        });
+        let hint_start = "a⋯".len() as u32;
+        assert_eq!(underlined(&map, 0..hint_start + 4_096, cx), 0);
+        assert_eq!(underlined(&map, hint_start + 100..hint_start + 350, cx), 0);
     }
 
     #[gpui::test]
@@ -6218,6 +6604,20 @@ pub mod tests {
                 DiagnosticSeverity::Warning,
                 cx,
             )
+        })
+    }
+
+    fn build_snapshot(
+        text: &str,
+        wrap_width: Option<Pixels>,
+        masked: bool,
+        cx: &mut gpui::TestAppContext,
+    ) -> DisplaySnapshot {
+        let buffer = cx.update(|cx| MultiBuffer::build_simple(text, cx));
+        let map = cx.update(|cx| inlay_test_map(buffer, test_font(), px(14.), wrap_width, cx));
+        map.update(cx, |map, cx| {
+            map.masked = masked;
+            map.snapshot(cx)
         })
     }
 }

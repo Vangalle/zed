@@ -2135,47 +2135,35 @@ mod tests {
                 );
             }
 
-            fn random_col(line: &str, rng: &mut impl Rng) -> u32 {
-                if line.is_empty() {
-                    return 0;
+            fn random_column(line: &str, rng: &mut impl Rng) -> u32 {
+                let mut column = rng.random_range(0..=line.len());
+                while !line.is_char_boundary(column) {
+                    column -= 1;
                 }
-                let mut col = rng.random_range(0..=line.len());
-                while !line.is_char_boundary(col) {
-                    col -= 1;
-                }
-                col as u32
+                column as u32
             }
             let text = self.text();
             let lines = text.split('\n').collect::<Vec<_>>();
+            let offset = |row: usize, column: u32| {
+                lines[..row]
+                    .iter()
+                    .map(|line| line.len() + 1)
+                    .sum::<usize>()
+                    + column as usize
+            };
             for _ in 0..10 {
                 let end_row = rng.random_range(0..lines.len());
                 let start_row = rng.random_range(0..=end_row);
-                let start_col = random_col(lines[start_row], rng);
-                let end_col = random_col(lines[end_row], rng);
-                let start = WrapPoint::new(WrapRow(start_row as u32), start_col);
-                let end = WrapPoint::new(WrapRow(end_row as u32), end_col);
+                let start_column = random_column(lines[start_row], rng);
+                let end_column = random_column(lines[end_row], rng);
+                let start = WrapPoint::new(WrapRow(start_row as u32), start_column);
+                let end = WrapPoint::new(WrapRow(end_row as u32), end_column);
                 if start >= end || self.range_intersects_wrap(start..end) {
                     continue;
                 }
 
-                let mut expected_text = String::new();
-                for row in start_row..=end_row {
-                    let line = lines[row];
-                    let s = if row == start_row {
-                        start_col as usize
-                    } else {
-                        0
-                    };
-                    let e = if row == end_row {
-                        end_col as usize
-                    } else {
-                        line.len()
-                    };
-                    expected_text.push_str(&line[s..e]);
-                    if row != end_row {
-                        expected_text.push('\n');
-                    }
-                }
+                let expected_text =
+                    &text[offset(start_row, start_column)..offset(end_row, end_column)];
 
                 let actual_text = self
                     .chunks(
@@ -2186,7 +2174,7 @@ mod tests {
                         },
                         Highlights::default(),
                     )
-                    .map(|c| c.text)
+                    .map(|chunk| chunk.text)
                     .collect::<String>();
                 assert_eq!(
                     expected_text,
